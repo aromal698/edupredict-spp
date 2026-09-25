@@ -117,6 +117,24 @@ def extract_completed(audit):
 def extract_pending(audit):
     return [r for r in _latest_work_state(audit) if str(r.get("action","")).strip()=="Tutor Work Saved - Pending Completion"]
 
+def tutor_name_from_event(row):
+    details = str(row.get("details", ""))
+    m = __import__("re").search(r"Tutor=([^;]+)", details)
+    if m:
+        return m.group(1).strip()
+    return str(row.get("username", "")).strip()
+
+def salary_breakdown(completed):
+    """One salary unit per completed student upload, scoped by tutor+department+semester."""
+    groups = {}
+    for r in completed:
+        tutor = tutor_name_from_event(r) or str(r.get("username", "")).strip() or "Unknown"
+        dept = str(r.get("department", "")).strip() or "Unknown"
+        sem = str(r.get("semester", "")).strip().upper() or "Unknown"
+        key = (tutor, dept, sem)
+        groups[key] = groups.get(key, 0) + 1
+    return groups
+
 
 def credit_from_subjects(subjects):
     vals = []
@@ -138,43 +156,19 @@ def credit_from_subjects(subjects):
 def build_tutor_summary(tutors, marks, audit):
     completed = extract_completed(audit)
     pending = extract_pending(audit)
-
-    mark_count = {}
-    mark_credits = {}
-    for m in marks:
-        tutor = str(m.get("tutor_name", "")).strip() or "Unknown"
-        mark_count[tutor] = mark_count.get(tutor, 0) + 1
-        credit = credit_from_subjects(parse_subjects(m.get("subjects", [])))
-        mark_credits.setdefault(tutor, []).append(credit)
-
-    tutor_name_by_id = {str(t.get("tutor_id", "")).strip(): str(t.get("tutor_name", "")).strip() for t in tutors if t.get("tutor_id")}
-    names = set()
-    for t in tutors:
-        name = str(t.get("tutor_name", "")).strip()
-        if name:
-            names.add(name)
-    names.update(tutor_name_by_id.get(str(r.get("username", "")).strip(), str(r.get("username", "")).strip()) for r in audit if r.get("username"))
-    names.update(tutor_name_by_id.get(str(k).strip(), str(k).strip()) for k in mark_count.keys())
-
-    out = []
-    for name in sorted(n for n in names if n):
-        done = [r for r in completed if tutor_name_by_id.get(str(r.get("username", "")).strip(), str(r.get("username", "")).strip()) == name]
-        pend = [r for r in pending if tutor_name_by_id.get(str(r.get("username", "")).strip(), str(r.get("username", "")).strip()) == name]
-        profile = next((t for t in tutors if str(t.get("tutor_name", "")).strip() == name), {})
-        credits = mark_credits.get(name, [])
-        departments = [str(r.get("department", "")).strip() for r in done + pend if r.get("department")]
-        department = str(profile.get("department", "")).strip() or (departments[-1] if departments else "")
-        out.append({
-            "Tutor Name": name,
-            "Department": department,
-            "Tutor Credit /10": round(float(profile.get("credit_score", 0) or 0), 2),
-            "Mark Submissions": mark_count.get(name, 0),
-            "Completed Work": len(done),
-            "Pending Work": len(pend),
-            "Students Completed": len({str(r.get("university_id", "")) for r in done if r.get("university_id")}),
-            "Avg Student Credit /10": round(sum(credits) / len(credits), 2) if credits else 0.0,
-            "Last Activity": max([str(r.get("timestamp", "")) for r in done + pend] or ["—"]),
-        })
+    groups = {}
+    for r in completed + pending:
+        tutor = tutor_name_from_event(r) or str(r.get("username", "")).strip() or "Unknown"
+        dept = str(r.get("department", "")).strip() or "Unknown"
+        sem = str(r.get("semester", "")).strip().upper() or "Unknown"
+        key=(tutor,dept,sem)
+        g=groups.setdefault(key,{"Completed Uploads":0,"Pending Uploads":0,"Last Activity":"—"})
+        if str(r.get("action", "")).strip()=="Tutor Work Completed": g["Completed Uploads"] += 1
+        else: g["Pending Uploads"] += 1
+        g["Last Activity"] = max(g["Last Activity"],str(r.get("timestamp", "")))
+    out=[]
+    for (tutor,dept,sem),g in sorted(groups.items()):
+        out.append({"Tutor Name":tutor,"Department":dept,"Semester":sem,**g})
     return pd.DataFrame(out)
 
 
@@ -245,7 +239,7 @@ def dashboard():
         if tutor_actions:
             activity = pd.DataFrame([{
                 "Time": r.get("timestamp", ""),
-                "Tutor Name": r.get("username", ""),
+                "Tutor Name": tutor_name_from_event(r),
                 "Action": r.get("action", ""),
                 "University ID": r.get("university_id", ""),
                 "Department": r.get("department", ""),
@@ -273,21 +267,21 @@ def dashboard():
             st.info("No tutor work available for salary calculation.")
         else:
             salary = summary.copy()
-            salary["Salary (₹)"] = salary["Completed Work"] * float(rate)
-            salary = salary[["Tutor Name", "Department", "Completed Work", "Pending Work", "Students Completed", "Avg Student Credit /10", "Salary (₹)"]]
+            salary["Salary (₹)"] = salary["Completed Uploads"] * float(rate)
+            salary = salary[["Tutor Name","Department","Semester","Completed Uploads","Pending Uploads","Salary (₹)"]]
             st.dataframe(salary, use_container_width=True, hide_index=True)
             total = float(salary["Salary (₹)"].sum())
             x,y,z = st.columns(3)
-            x.metric("✅ Completed Work", int(salary["Completed Work"].sum()))
-            y.metric("⏳ Pending Work", int(salary["Pending Work"].sum()))
+            x.metric("✅ Completed Uploads", int(salary["Completed Uploads"].sum()))
+            y.metric("⏳ Pending Uploads", int(salary["Pending Uploads"].sum()))
             z.metric("💰 Total Tutor Salary", f"₹{total:,.2f}")
-            st.caption("Salary is a project calculation: Completed Work × Salary per completed student work.")
+            st.caption("Salary rule: each completed student mark upload = 1 salary unit. The unit is counted only for the tutor's assigned department + selected semester. Pending uploads receive no salary.")
 
         st.subheader("✅ Completed Work Details")
         if completed:
             details = pd.DataFrame([{
                 "Completed At": r.get("timestamp", ""),
-                "Tutor": r.get("username", ""),
+                "Tutor": tutor_name_from_event(r),
                 "Student": r.get("university_id", ""),
                 "Department": r.get("department", ""),
                 "Semester": r.get("semester", ""),
@@ -342,7 +336,7 @@ def dashboard():
             tutor_df=pd.DataFrame([{
                 "Tutor Username":r.get("tutor_id",""), "Tutor Name":r.get("tutor_name",""),
                 "Department":r.get("department",""), "Semester":r.get("semester","") or "All",
-                "Tutor Credit /10":r.get("credit_score",0), "Active":r.get("active",True),
+                "Active":r.get("active",True),
                 "Registered At":r.get("registered_at","")
             } for r in tutors])
             st.dataframe(tutor_df,use_container_width=True,hide_index=True)
