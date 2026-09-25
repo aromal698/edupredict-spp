@@ -277,6 +277,83 @@ def write_runtime_folders(folders, completed, rate):
 def folder_dataframe(data):
     return pd.DataFrame(data) if data else pd.DataFrame()
 
+def write_daily_records(students, tutors, marks, smart, audit, completed, rate):
+    """Create separate day-by-day CSV files from the current Supabase data.
+    Each calendar day gets its own folder and files. These are regenerated from
+    Supabase on every Principal refresh, so deleted students disappear from the
+    current daily files too.
+    """
+    root = os.path.join(os.getcwd(), "principal_records", "Daily Records")
+    os.makedirs(root, exist_ok=True)
+
+    def day_of(value):
+        ts = parse_event_dt(value)
+        if pd.isna(ts):
+            return "Unknown-Date"
+        return ts.strftime("%Y-%m-%d")
+
+    def write_rows(day, filename, rows):
+        folder = os.path.join(root, safe_folder_name(day))
+        os.makedirs(folder, exist_ok=True)
+        pd.DataFrame(rows).to_csv(os.path.join(folder, filename), index=False)
+
+    groups = {}
+    for r in students:
+        groups.setdefault(day_of(r.get("registered_at")), {"students": [], "tutors": [], "marks": [], "smart": [], "activity": [], "completed": []})["students"].append(r)
+    for r in tutors:
+        groups.setdefault(day_of(r.get("registered_at")), {"students": [], "tutors": [], "marks": [], "smart": [], "activity": [], "completed": []})["tutors"].append(r)
+    for r in marks:
+        groups.setdefault(day_of(r.get("submitted_at")), {"students": [], "tutors": [], "marks": [], "smart": [], "activity": [], "completed": []})["marks"].append(r)
+    for r in smart:
+        groups.setdefault(day_of(r.get("submitted_at")), {"students": [], "tutors": [], "marks": [], "smart": [], "activity": [], "completed": []})["smart"].append(r)
+    for r in audit:
+        groups.setdefault(day_of(r.get("timestamp")), {"students": [], "tutors": [], "marks": [], "smart": [], "activity": [], "completed": []})["activity"].append(r)
+    for r in completed:
+        groups.setdefault(day_of(r.get("timestamp")), {"students": [], "tutors": [], "marks": [], "smart": [], "activity": [], "completed": []})["completed"].append(r)
+
+    for day, g in groups.items():
+        write_rows(day, "students_records.csv", g["students"])
+        write_rows(day, "tutors_records.csv", g["tutors"])
+        write_rows(day, "marks_records.csv", g["marks"])
+        write_rows(day, "smart_cards_records.csv", g["smart"])
+        write_rows(day, "tutor_activity.csv", g["activity"])
+        salary_rows = [{
+            "Completed At": r.get("timestamp", ""), "Tutor": tutor_name_from_event(r),
+            "University ID": r.get("university_id", ""), "Department": r.get("department", ""),
+            "Semester": r.get("semester", ""), "Salary (₹)": float(rate),
+        } for r in g["completed"]]
+        write_rows(day, "completed_salary_records.csv", salary_rows)
+    return root, sorted(groups.keys(), reverse=True)
+
+
+def remove_runtime_student_records(uid):
+    """Remove a student's UID from generated Principal CSV files on this runtime."""
+    uid = str(uid or "").strip()
+    if not uid:
+        return 0
+    root = os.path.join(os.getcwd(), "principal_records")
+    removed = 0
+    if not os.path.isdir(root):
+        return removed
+    for base, _, files in os.walk(root):
+        for fn in files:
+            if not fn.lower().endswith(".csv"):
+                continue
+            path = os.path.join(base, fn)
+            try:
+                df = pd.read_csv(path)
+                before = len(df)
+                for col in ["University ID", "university_id", "University_ID", "Student ID"]:
+                    if col in df.columns:
+                        df = df[df[col].astype(str).str.strip().ne(uid)]
+                if len(df) != before:
+                    df.to_csv(path, index=False)
+                    removed += before - len(df)
+            except Exception:
+                pass
+    return removed
+
+
 def delete_student_everywhere(sb, student, audit_user="Principal"):
     """Delete one student and all related records from Supabase and known local files."""
     uid = str(student.get("university_id", "")).strip()
@@ -286,6 +363,12 @@ def delete_student_everywhere(sb, student, audit_user="Principal"):
     sem = str(student.get("semester", "") or "").strip().upper()
 
     file_rows = rows(sb.table("student_files").select("file_path,file_name").eq("university_id", uid).execute())
+    # Remove the student's old Principal/Tutor activity records so the student
+    # disappears from Principal activity, folders, daily files and salary views.
+    try:
+        sb.table("audit_logs").delete().eq("university_id", uid).execute()
+    except Exception:
+        pass
     sb.table("student_marks").delete().eq("university_id", uid).execute()
     sb.table("smart_cards").delete().eq("university_id", uid).execute()
     sb.table("student_files").delete().eq("university_id", uid).execute()
@@ -300,6 +383,8 @@ def delete_student_everywhere(sb, student, audit_user="Principal"):
                 removed_files += 1
             except OSError:
                 pass
+
+    remove_runtime_student_records(uid)
 
     sb.table("audit_logs").insert({
         "username": audit_user,
@@ -371,8 +456,8 @@ def dashboard():
 
     st.success("🟢 LIVE: Tutor completion records are read from the same Supabase database used by the Student/Tutor app.")
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "👨‍🏫 Live Tutor Activity", "💰 Tutor Salary Analysis", "🪪 Smart Cards", "📁 Academic Folders", "🗑️ Delete Student"
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+        "👨‍🏫 Live Tutor Activity", "💰 Tutor Salary Analysis", "🪪 Smart Cards", "📁 Academic Folders", "📅 Daily Records", "🗑️ Delete Student"
     ])
 
     with tab1:
@@ -572,8 +657,46 @@ def dashboard():
 
 
     with tab5:
+        st.subheader("📅 Day-by-Day Recorded Files / Tables")
+        st.caption("Every day is kept separately as YYYY-MM-DD. The tables below are regenerated from the live Supabase database, so a deleted student is removed from the displayed records.")
+        rate_for_daily = float(rate) if "rate" in locals() else 100.0
+        daily_root, available_days = write_daily_records(students, tutors, marks, smart, audit, completed, rate_for_daily)
+        if not available_days:
+            st.info("No dated records available yet.")
+        else:
+            selected_day = st.selectbox("📅 Select recording day", available_days, key="principal_daily_day")
+            day_folder = os.path.join(daily_root, safe_folder_name(selected_day))
+            st.markdown(f"### 📅 Records for {selected_day}")
+            files_for_day = [
+                ("students_records.csv", "👨‍🎓 Students"),
+                ("tutors_records.csv", "👨‍🏫 Tutors"),
+                ("marks_records.csv", "📝 Marks"),
+                ("smart_cards_records.csv", "🪪 Smart Cards"),
+                ("tutor_activity.csv", "🔴 Tutor Activity"),
+                ("completed_salary_records.csv", "💰 Completed / Salary"),
+            ]
+            for filename, title in files_for_day:
+                path = os.path.join(day_folder, filename)
+                st.markdown(f"**{title}** — `{filename}`")
+                if os.path.isfile(path):
+                    try:
+                        ddf = pd.read_csv(path)
+                    except Exception:
+                        ddf = pd.DataFrame()
+                    if ddf.empty:
+                        st.info("No records in this table for this day.")
+                    else:
+                        st.dataframe(ddf, use_container_width=True, hide_index=True)
+                        st.download_button(f"📥 Download {filename}", ddf.to_csv(index=False).encode(), filename, "text/csv", key=f"daily_download_{selected_day}_{filename}")
+                else:
+                    st.info("No records in this table for this day.")
+
+        st.caption(f"Daily files are generated under `{daily_root}` on the current Streamlit runtime. Supabase is the permanent source of truth.")
+
+
+    with tab6:
         st.subheader("🗑️ Delete Student — One at a Time")
-        st.warning("⚠️ Permanent deletion: this removes the selected student's registration, marks/results, Smart Card, uploaded student files, and related Supabase records. The deletion is also recorded in the Principal audit log.")
+        st.warning("⚠️ Permanent deletion: this removes the selected student's registration, marks/results, Smart Card, uploaded student files, old tutor activity, daily Principal records and related Supabase records. A new deletion audit entry is kept.")
         if not students:
             st.info("No registered students are available to delete.")
         else:
