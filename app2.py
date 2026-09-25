@@ -277,6 +277,42 @@ def write_runtime_folders(folders, completed, rate):
 def folder_dataframe(data):
     return pd.DataFrame(data) if data else pd.DataFrame()
 
+def delete_student_everywhere(sb, student, audit_user="Principal"):
+    """Delete one student and all related records from Supabase and known local files."""
+    uid = str(student.get("university_id", "")).strip()
+    if not uid:
+        raise ValueError("Student University ID is missing.")
+    dept = str(student.get("department", "") or "").strip()
+    sem = str(student.get("semester", "") or "").strip().upper()
+
+    file_rows = rows(sb.table("student_files").select("file_path,file_name").eq("university_id", uid).execute())
+    sb.table("student_marks").delete().eq("university_id", uid).execute()
+    sb.table("smart_cards").delete().eq("university_id", uid).execute()
+    sb.table("student_files").delete().eq("university_id", uid).execute()
+    sb.table("students").delete().eq("university_id", uid).execute()
+
+    removed_files = 0
+    for item in file_rows:
+        path = str(item.get("file_path") or "").strip()
+        if path and os.path.isfile(path):
+            try:
+                os.remove(path)
+                removed_files += 1
+            except OSError:
+                pass
+
+    sb.table("audit_logs").insert({
+        "username": audit_user,
+        "role": "Principal",
+        "action": "Student Deleted",
+        "university_id": uid,
+        "department": dept,
+        "semester": sem,
+        "details": f"Deleted student {student.get('student_name', '')}; removed marks, Smart Card, student files and registration. Local files removed: {removed_files}."
+    }).execute()
+    return uid, removed_files
+
+
 def login():
     st.title("🛡️ EduPredict SPP — Principal Portal")
     st.caption("Live Tutor monitoring • Completed work • Salary analysis • Student monitoring")
@@ -335,8 +371,8 @@ def dashboard():
 
     st.success("🟢 LIVE: Tutor completion records are read from the same Supabase database used by the Student/Tutor app.")
 
-    tab1, tab2, tab3, tab4 = st.tabs([
-        "👨‍🏫 Live Tutor Activity", "💰 Tutor Salary Analysis", "🪪 Smart Cards", "📁 Academic Folders"
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "👨‍🏫 Live Tutor Activity", "💰 Tutor Salary Analysis", "🪪 Smart Cards", "📁 Academic Folders", "🗑️ Delete Student"
     ])
 
     with tab1:
@@ -535,6 +571,41 @@ def dashboard():
             st.caption(f"Runtime folder tree created at: `{runtime_root}`. Supabase remains the permanent database; Streamlit Cloud runtime folders can reset on redeploy/restart.")
 
 
+    with tab5:
+        st.subheader("🗑️ Delete Student — One at a Time")
+        st.warning("⚠️ Permanent deletion: this removes the selected student's registration, marks/results, Smart Card, uploaded student files, and related Supabase records. The deletion is also recorded in the Principal audit log.")
+        if not students:
+            st.info("No registered students are available to delete.")
+        else:
+            student_options = {
+                f"{r.get('university_id','')} — {r.get('student_name','')} — {r.get('department','')} / {r.get('semester','')}": r
+                for r in students
+            }
+            selected_label = st.selectbox("Select ONE student to delete", list(student_options.keys()), key="principal_delete_student_select")
+            selected_student = student_options[selected_label]
+            st.markdown("### Selected student")
+            preview = pd.DataFrame([{
+                "University ID": selected_student.get("university_id", ""),
+                "Student Name": selected_student.get("student_name", ""),
+                "Department": selected_student.get("department", ""),
+                "Semester": selected_student.get("semester", ""),
+                "Studied College": selected_student.get("studied_college", "") or "",
+                "Registered By": selected_student.get("registered_by", "") or "",
+            }])
+            st.dataframe(preview, use_container_width=True, hide_index=True)
+            confirm = st.checkbox("I understand this permanently deletes ALL details for this selected student.", key="principal_delete_student_confirm")
+            if st.button("🗑️ DELETE SELECTED STUDENT", type="primary", use_container_width=True, disabled=not confirm):
+                try:
+                    uid, removed_files = delete_student_everywhere(sb, selected_student, audit_user=PRINCIPAL_USERNAME)
+                    st.success(f"✅ Student {uid} deleted successfully. Local files removed: {removed_files}.")
+                    st.session_state.pop("principal_delete_student_select", None)
+                    st.session_state.pop("principal_delete_student_confirm", None)
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"❌ Delete failed: {exc}")
+
+
+
 if "principal_auth" not in st.session_state:
     st.session_state.principal_auth = False
 
@@ -542,3 +613,4 @@ if not st.session_state.principal_auth:
     login()
 else:
     dashboard()
+
