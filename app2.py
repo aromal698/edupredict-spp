@@ -147,18 +147,19 @@ def build_tutor_summary(tutors, marks, audit):
         credit = credit_from_subjects(parse_subjects(m.get("subjects", [])))
         mark_credits.setdefault(tutor, []).append(credit)
 
+    tutor_name_by_id = {str(t.get("tutor_id", "")).strip(): str(t.get("tutor_name", "")).strip() for t in tutors if t.get("tutor_id")}
     names = set()
     for t in tutors:
         name = str(t.get("tutor_name", "")).strip()
         if name:
             names.add(name)
-    names.update(str(r.get("username", "")).strip() for r in audit if r.get("username"))
-    names.update(mark_count.keys())
+    names.update(tutor_name_by_id.get(str(r.get("username", "")).strip(), str(r.get("username", "")).strip()) for r in audit if r.get("username"))
+    names.update(tutor_name_by_id.get(str(k).strip(), str(k).strip()) for k in mark_count.keys())
 
     out = []
     for name in sorted(n for n in names if n):
-        done = [r for r in completed if str(r.get("username", "")).strip() == name]
-        pend = [r for r in pending if str(r.get("username", "")).strip() == name]
+        done = [r for r in completed if tutor_name_by_id.get(str(r.get("username", "")).strip(), str(r.get("username", "")).strip()) == name]
+        pend = [r for r in pending if tutor_name_by_id.get(str(r.get("username", "")).strip(), str(r.get("username", "")).strip()) == name]
         profile = next((t for t in tutors if str(t.get("tutor_name", "")).strip() == name), {})
         credits = mark_credits.get(name, [])
         departments = [str(r.get("department", "")).strip() for r in done + pend if r.get("department")]
@@ -297,23 +298,56 @@ def dashboard():
             st.info("No Tutor work has been marked Completed yet.")
 
     with tab3:
-        st.subheader("🪪 Smart Card Monitoring")
+        st.subheader("🪪 Smart Card + Full Student Monitoring")
+        st.caption("Principal can see the complete Smart Card details, student profile, tutor directory, and live tutor work from the shared database.")
         if smart:
-            st.caption("Smart Card preview is kept compact while using large, readable text.")
             latest_card = smart[0]
-            st.markdown(f"<div class='smart-preview'><div style='font-size:.8rem;letter-spacing:.12em;color:#bfdbfe'>EDUPREDICT SPP • STUDENT SMART CARD</div><div style='font-size:1.65rem;margin-top:8px'>{latest_card.get('name','')}</div><div style='font-family:monospace;font-size:1.15rem;margin-top:4px'>{latest_card.get('registration_id','')}</div><div style='margin-top:14px;font-size:1rem;line-height:1.65'>University ID: {latest_card.get('university_id','')}<br>DOB: {latest_card.get('dob','')} • Blood: {latest_card.get('blood_group','')}<br>{latest_card.get('department','')} • {latest_card.get('semester','')}</div></div>", unsafe_allow_html=True)
+            st.markdown(f"""<div class='smart-preview' style='background:linear-gradient(135deg,#062a6b,#0b63ce,#12a4d8,#083b8f);font-size:1.05rem;line-height:1.7;position:relative;overflow:hidden'>
+            <div style='font-size:.92rem;letter-spacing:.16em;color:#e0f2fe;font-weight:800'>EDUPREDICT SPP • STUDENT IDENTITY CARD</div>
+            <div style='font-size:2.25rem;font-weight:900;color:white;margin-top:8px'>{latest_card.get('name','')}</div>
+            <div style='font-family:monospace;font-size:1.35rem;color:white;font-weight:800'>{latest_card.get('registration_id','')}</div>
+            <div style='display:grid;grid-template-columns:1fr 1fr;gap:8px 20px;margin-top:18px'>
+            <div><b>DOB</b><br>{latest_card.get('dob','')}</div><div><b>Blood Group</b><br>{latest_card.get('blood_group','')}</div>
+            <div><b>University ID</b><br>{latest_card.get('university_id','')}</div><div><b>PIN Code</b><br>{latest_card.get('pin_code','')}</div>
+            <div><b>Department</b><br>{latest_card.get('department','')}</div><div><b>Semester</b><br>{latest_card.get('semester','')}</div>
+            <div><b>CGPA</b><br>{latest_card.get('cgpa','') or '—'}</div><div><b>University</b><br>{latest_card.get('university_name','')}</div>
+            <div style='grid-column:1/-1'><b>Studied College</b><br>{latest_card.get('studied_college','')}</div>
+            <div style='grid-column:1/-1'><b>Address</b><br>{latest_card.get('address','')}</div>
+            </div></div>""", unsafe_allow_html=True)
             sdf = pd.DataFrame([{
-                "Registration ID": r.get("registration_id", ""), "Name": r.get("name", ""),
-                "University ID": r.get("university_id", ""), "DOB": r.get("dob", ""),
-                "Blood Group": r.get("blood_group", ""), "Address": r.get("address", ""),
-                "PIN Code": r.get("pin_code", ""), "Studied College": r.get("studied_college", ""),
-                "Department": r.get("department", ""), "Semester": r.get("semester", ""),
-                "CGPA": r.get("cgpa", ""), "University": r.get("university_name", ""),
-                "Submitted": r.get("submitted_at", ""),
+                "Registration ID": r.get("registration_id", ""), "Name": r.get("name", ""), "University ID": r.get("university_id", ""),
+                "DOB": r.get("dob", ""), "Blood Group": r.get("blood_group", ""), "Address": r.get("address", ""),
+                "PIN Code": r.get("pin_code", ""), "Studied College": r.get("studied_college", ""), "Department": r.get("department", ""),
+                "Semester": r.get("semester", ""), "CGPA": r.get("cgpa", ""), "University": r.get("university_name", ""), "Submitted": r.get("submitted_at", ""),
             } for r in smart])
             st.dataframe(sdf, use_container_width=True, hide_index=True)
+            st.download_button("📥 Download All Smart Card Records", sdf.to_csv(index=False).encode(), "all_smart_cards.csv", "text/csv")
         else:
             st.info("No Smart Cards registered yet.")
+
+        st.subheader("👨‍🎓 Complete Student Profiles")
+        if students:
+            student_df=pd.DataFrame([{
+                "University ID":r.get("university_id",""), "Student Name":r.get("student_name",""),
+                "Department":r.get("department",""), "Semester":r.get("semester",""),
+                "Studied College":r.get("studied_college","") or "", "Registered By":r.get("registered_by",""),
+                "Registered At":r.get("registered_at","")
+            } for r in students])
+            st.dataframe(student_df,use_container_width=True,hide_index=True)
+        else:
+            st.info("No student profiles available.")
+
+        st.subheader("👨‍🏫 Tutor Directory")
+        if tutors:
+            tutor_df=pd.DataFrame([{
+                "Tutor Username":r.get("tutor_id",""), "Tutor Name":r.get("tutor_name",""),
+                "Department":r.get("department",""), "Semester":r.get("semester","") or "All",
+                "Tutor Credit /10":r.get("credit_score",0), "Active":r.get("active",True),
+                "Registered At":r.get("registered_at","")
+            } for r in tutors])
+            st.dataframe(tutor_df,use_container_width=True,hide_index=True)
+        else:
+            st.info("No tutor profiles available yet.")
 
 
 if "principal_auth" not in st.session_state:
