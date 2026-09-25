@@ -12,7 +12,20 @@ from supabase import create_client, Client
 
 
 def _setting(name: str) -> str:
-    value = st.secrets.get(name, "")
+    # Streamlit Cloud secrets are case-sensitive. Support the recommended
+    # SUPABASE_KEY and common SECRET_KEY naming so deployment is less fragile.
+    aliases = {
+        "SUPABASE_KEY": ["SUPABASE_KEY", "SUPABASE_SECRET_KEY", "SUPABASE_SERVICE_ROLE_KEY"],
+        "SUPABASE_URL": ["SUPABASE_URL", "SUPABASE_PROJECT_URL"],
+    }
+    value = ""
+    for candidate in aliases.get(name, [name]):
+        try:
+            value = st.secrets.get(candidate, "")
+        except Exception:
+            value = ""
+        if value:
+            break
     if value is None:
         return ""
     return str(value).strip()
