@@ -119,11 +119,28 @@ def extract_completed(audit):
 def extract_pending(audit):
     return [r for r in _latest_work_state(audit) if str(r.get("action","")).strip()=="Tutor Work Saved - Pending Completion"]
 
-def tutor_name_from_event(row):
+def tutor_name_from_event(row, tutors=None):
+    """Return the real Tutor Name for Principal display.
+    Never show the login username such as teacher_ce when a tutor record exists.
+    """
     details = str(row.get("details", ""))
     m = __import__("re").search(r"Tutor=([^;]+)", details)
-    if m:
+    if m and m.group(1).strip():
         return m.group(1).strip()
+
+    username = str(row.get("username", "")).strip()
+    if tutors:
+        for t in tutors:
+            tid = str(t.get("tutor_id", "")).strip()
+            name = str(t.get("tutor_name", "")).strip()
+            if username and tid and username.lower() == tid.lower() and name:
+                return name
+            if username and name and username.lower() == name.lower():
+                return name
+    return username
+
+
+def tutor_id_from_event(row):
     return str(row.get("username", "")).strip()
 
 def salary_breakdown(completed):
@@ -160,7 +177,7 @@ def build_tutor_summary(tutors, marks, audit):
     pending = extract_pending(audit)
     groups = {}
     for r in completed + pending:
-        tutor = tutor_name_from_event(r) or str(r.get("username", "")).strip() or "Unknown"
+        tutor = tutor_name_from_event(r, tutors) or str(r.get("username", "")).strip() or "Unknown"
         dept = str(r.get("department", "")).strip() or "Unknown"
         sem = str(r.get("semester", "")).strip().upper() or "Unknown"
         key=(tutor,dept,sem)
@@ -465,7 +482,7 @@ def dashboard():
         if tutor_actions:
             activity = pd.DataFrame([{
                 "Time": r.get("timestamp", ""),
-                "Tutor Name": tutor_name_from_event(r),
+                "Tutor Name": tutor_name_from_event(r, tutors),
                 "Action": r.get("action", ""),
                 "University ID": r.get("university_id", ""),
                 "Department": r.get("department", ""),
@@ -496,12 +513,12 @@ def dashboard():
             tname = str(tutor.get("tutor_name", "") or tid or "Unknown")
             dept = str(tutor.get("department", "") or "")
             sem = str(tutor.get("semester", "") or "").upper()
-            own = [r for r in completed if str(r.get("username", "")).strip() == tid]
-            # If audit username stores tutor name instead of ID, also match name.
-            own += [r for r in completed if str(r.get("username", "")).strip() == tname and r not in own]
+            own = [r for r in completed if str(r.get("username", "")).strip().lower() == tid.lower()]
+            # Also match events where the tutor name itself was stored.
+            own += [r for r in completed if tutor_name_from_event(r, tutors).strip().lower() == tname.lower() and r not in own]
             unique_students = {str(r.get("university_id", "")).strip() for r in own if str(r.get("university_id", "")).strip()}
             tutor_rows.append({
-                "Tutor Name": tname, "Tutor ID": tid, "Department": dept, "Semester": sem,
+                "Tutor Name": tname, "Department": dept, "Semester": sem,
                 "Students Completed": len(unique_students),
                 "Completed Work": len(own),
                 "Salary (₹)": len(unique_students) * float(rate),
@@ -527,15 +544,14 @@ def dashboard():
                 uid = str(r.get("university_id", "")).strip()
                 monthly_rows.append({
                     "Month": month_label(r.get("timestamp")),
-                    "Tutor Name": tutor_name_from_event(r),
-                    "Tutor ID": r.get("username", ""),
+                    "Tutor Name": tutor_name_from_event(r, tutors),
                     "Department": r.get("department", ""),
                     "Semester": str(r.get("semester", "")).upper(),
                     "Students Completed": 1 if uid else 0,
                     "Salary (₹)": float(rate) if uid else 0.0,
                 })
             monthly = pd.DataFrame(monthly_rows).groupby(
-                ["Month", "Tutor Name", "Tutor ID", "Department", "Semester"], as_index=False
+                ["Month", "Tutor Name", "Department", "Semester"], as_index=False
             ).agg({"Students Completed":"sum", "Salary (₹)":"sum"}).sort_values(["Month", "Tutor Name"], ascending=[False, True])
             st.dataframe(monthly, use_container_width=True, hide_index=True)
             st.download_button("📥 Download Monthly Tutor Salary", monthly.to_csv(index=False).encode(), "monthly_tutor_salary.csv", "text/csv", use_container_width=True)
@@ -546,8 +562,7 @@ def dashboard():
         if completed:
             details = pd.DataFrame([{
                 "Completed At": r.get("timestamp", ""),
-                "Tutor": tutor_name_from_event(r),
-                "Tutor ID": r.get("username", ""),
+                "Tutor": tutor_name_from_event(r, tutors),
                 "Student University ID": r.get("university_id", ""),
                 "Department": r.get("department", ""),
                 "Semester": r.get("semester", ""),
@@ -633,7 +648,14 @@ def dashboard():
                 st.dataframe(df, use_container_width=True, hide_index=True) if not df.empty else st.info("No students in this folder.")
             with f2:
                 df = folder_dataframe(g["tutors"])
-                st.dataframe(df, use_container_width=True, hide_index=True) if not df.empty else st.info("No tutors in this folder.")
+                if not df.empty:
+                    # Principal sees the tutor's real registered name, not login IDs such as teacher_ce.
+                    preferred = [c for c in ["Tutor Name", "Department", "Semester", "Credit Score"] if c in df.columns]
+                    if preferred:
+                        df = df[preferred]
+                    st.dataframe(df, use_container_width=True, hide_index=True)
+                else:
+                    st.info("No tutors in this folder.")
             with f3:
                 df = folder_dataframe(g["marks"])
                 st.dataframe(df, use_container_width=True, hide_index=True) if not df.empty else st.info("No mark records in this folder.")
@@ -649,7 +671,7 @@ def dashboard():
             salary_records = []
             for r in completed:
                 salary_records.append({
-                    "Tutor Name": tutor_name_from_event(r),
+                    "Tutor Name": tutor_name_from_event(r, tutors),
                     "Month": month_label(r.get("timestamp")),
                     "Department": r.get("department", ""),
                     "Semester": str(r.get("semester", "")).upper(),
