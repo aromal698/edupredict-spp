@@ -486,54 +486,72 @@ def dashboard():
 
     with tab2:
         st.subheader("💰 Tutor Salary Analysis")
-        st.info("Only work explicitly marked **Completed** by the Tutor is counted. Pending work is not included in salary.")
-        rate = st.number_input("Salary per completed student work (₹)", min_value=0.0, value=100.0, step=10.0, key="principal_salary_rate")
-        summary = build_tutor_summary(tutors, marks, audit)
-        if summary.empty:
-            st.info("No tutor work available for salary calculation.")
-        else:
-            salary = summary.copy()
-            salary["Salary (₹)"] = salary["Completed Uploads"] * float(rate)
-            salary = salary[["Tutor Name","Department","Semester","Completed Uploads","Pending Uploads","Salary (₹)"]]
-            st.dataframe(salary, use_container_width=True, hide_index=True)
-            total = float(salary["Salary (₹)"].sum())
-            x,y,z = st.columns(3)
-            x.metric("✅ Completed Uploads", int(salary["Completed Uploads"].sum()))
-            y.metric("⏳ Pending Uploads", int(salary["Pending Uploads"].sum()))
-            z.metric("💰 Total Tutor Salary", f"₹{total:,.2f}")
-            st.caption("Salary rule: each completed student mark upload = 1 salary unit. The unit is counted only for the tutor's assigned department + selected semester. Pending uploads receive no salary.")
+        st.info("Salary is based on the number of students each tutor successfully completes/registers. Every completed student = one salary unit.")
+        rate = st.number_input("Salary per completed/registered student (₹)", min_value=0.0, value=100.0, step=10.0, key="principal_salary_rate")
 
-        st.subheader("📅 Monthly Salary — Tutor / Month")
+        # Count tutor work from Completed audit records, grouped by tutor.
+        tutor_rows = []
+        for tutor in tutors:
+            tid = str(tutor.get("tutor_id", "")).strip()
+            tname = str(tutor.get("tutor_name", "") or tid or "Unknown")
+            dept = str(tutor.get("department", "") or "")
+            sem = str(tutor.get("semester", "") or "").upper()
+            own = [r for r in completed if str(r.get("username", "")).strip() == tid]
+            # If audit username stores tutor name instead of ID, also match name.
+            own += [r for r in completed if str(r.get("username", "")).strip() == tname and r not in own]
+            unique_students = {str(r.get("university_id", "")).strip() for r in own if str(r.get("university_id", "")).strip()}
+            tutor_rows.append({
+                "Tutor Name": tname, "Tutor ID": tid, "Department": dept, "Semester": sem,
+                "Students Completed": len(unique_students),
+                "Completed Work": len(own),
+                "Salary (₹)": len(unique_students) * float(rate),
+            })
+
+        salary_df = pd.DataFrame(tutor_rows)
+        if salary_df.empty:
+            st.info("No tutors registered yet.")
+        else:
+            salary_df = salary_df.sort_values("Tutor Name")
+            st.subheader("👨‍🏫 Tutor-wise Salary Table")
+            st.dataframe(salary_df, use_container_width=True, hide_index=True)
+            st.download_button("📥 Download Tutor Salary Table", salary_df.to_csv(index=False).encode(), "tutor_salary_table.csv", "text/csv", use_container_width=True)
+            x,y,z = st.columns(3)
+            x.metric("👨‍🏫 Tutors", len(salary_df))
+            y.metric("👥 Students Completed", int(salary_df["Students Completed"].sum()))
+            z.metric("💰 Total Salary", f"₹{salary_df['Salary (₹)'].sum():,.2f}")
+
+        st.subheader("📅 Monthly Salary — Every Tutor")
         if completed:
             monthly_rows = []
             for r in completed:
+                uid = str(r.get("university_id", "")).strip()
                 monthly_rows.append({
                     "Month": month_label(r.get("timestamp")),
                     "Tutor Name": tutor_name_from_event(r),
+                    "Tutor ID": r.get("username", ""),
                     "Department": r.get("department", ""),
                     "Semester": str(r.get("semester", "")).upper(),
-                    "Completed Uploads": 1,
-                    "Salary (₹)": float(rate),
+                    "Students Completed": 1 if uid else 0,
+                    "Salary (₹)": float(rate) if uid else 0.0,
                 })
             monthly = pd.DataFrame(monthly_rows).groupby(
-                ["Month", "Tutor Name", "Department", "Semester"], as_index=False
-            ).agg({"Completed Uploads": "sum", "Salary (₹)": "sum"}).sort_values(
-                ["Month", "Tutor Name"], ascending=[False, True]
-            )
+                ["Month", "Tutor Name", "Tutor ID", "Department", "Semester"], as_index=False
+            ).agg({"Students Completed":"sum", "Salary (₹)":"sum"}).sort_values(["Month", "Tutor Name"], ascending=[False, True])
             st.dataframe(monthly, use_container_width=True, hide_index=True)
-            st.download_button("📥 Download Monthly Tutor Salary", monthly.to_csv(index=False).encode(), "monthly_tutor_salary.csv", "text/csv")
+            st.download_button("📥 Download Monthly Tutor Salary", monthly.to_csv(index=False).encode(), "monthly_tutor_salary.csv", "text/csv", use_container_width=True)
         else:
             st.info("No completed tutor work for monthly salary yet.")
 
-        st.subheader("✅ Completed Work Details")
+        st.subheader("✅ Tutor Completed Work + Salary Details")
         if completed:
             details = pd.DataFrame([{
                 "Completed At": r.get("timestamp", ""),
                 "Tutor": tutor_name_from_event(r),
-                "Student": r.get("university_id", ""),
+                "Tutor ID": r.get("username", ""),
+                "Student University ID": r.get("university_id", ""),
                 "Department": r.get("department", ""),
                 "Semester": r.get("semester", ""),
-                "Details": r.get("details", ""),
+                "Salary (₹)": float(rate),
             } for r in completed])
             st.dataframe(details, use_container_width=True, hide_index=True)
         else:
