@@ -120,24 +120,37 @@ def extract_pending(audit):
     return [r for r in _latest_work_state(audit) if str(r.get("action","")).strip()=="Tutor Work Saved - Pending Completion"]
 
 def tutor_name_from_event(row, tutors=None):
-    """Return the real Tutor Name for Principal display.
-    Never show the login username such as teacher_ce when a tutor record exists.
+    """Return ONLY the registered Tutor Name for Principal-facing records.
+    Login IDs such as teacher_ce/teacher_aids are never shown.
     """
-    details = str(row.get("details", ""))
-    m = __import__("re").search(r"Tutor=([^;]+)", details)
-    if m and m.group(1).strip():
-        return m.group(1).strip()
-
     username = str(row.get("username", "")).strip()
-    if tutors:
-        for t in tutors:
-            tid = str(t.get("tutor_id", "")).strip()
-            name = str(t.get("tutor_name", "")).strip()
-            if username and tid and username.lower() == tid.lower() and name:
-                return name
-            if username and name and username.lower() == name.lower():
-                return name
-    return username
+    details = str(row.get("details", ""))
+
+    # First resolve the audit username against the Supabase tutors table.
+    for t in (tutors or []):
+        tid = str(t.get("tutor_id", "")).strip()
+        name = str(t.get("tutor_name", "")).strip()
+        if not name:
+            continue
+        if username and tid and username.lower() == tid.lower():
+            return name
+        if username and username.lower() == name.lower():
+            return name
+
+    # Older audit rows may have stored the tutor name in details.
+    m = __import__("re").search(r"Tutor=([^;]+)", details)
+    if m:
+        candidate = m.group(1).strip()
+        # Never return a teacher_* login ID from the details field.
+        if candidate and not candidate.lower().startswith("teacher_"):
+            return candidate
+        for t in (tutors or []):
+            if str(t.get("tutor_id", "")).strip().lower() == candidate.lower():
+                return str(t.get("tutor_name", "")).strip() or "Registered Tutor"
+
+    # If no real name can be resolved, use a safe display label instead of
+    # exposing the authentication username.
+    return "Registered Tutor"
 
 
 def tutor_id_from_event(row):
@@ -147,7 +160,7 @@ def salary_breakdown(completed):
     """One salary unit per completed student upload, scoped by tutor+department+semester."""
     groups = {}
     for r in completed:
-        tutor = tutor_name_from_event(r) or str(r.get("username", "")).strip() or "Unknown"
+        tutor = tutor_name_from_event(r, []) or "Registered Tutor"
         dept = str(r.get("department", "")).strip() or "Unknown"
         sem = str(r.get("semester", "")).strip().upper() or "Unknown"
         key = (tutor, dept, sem)
@@ -274,7 +287,7 @@ def write_runtime_folders(folders, completed, rate):
     os.makedirs(salary_root, exist_ok=True)
     by_month_tutor = {}
     for r in completed:
-        tutor = tutor_name_from_event(r) or "Unknown"
+        tutor = tutor_name_from_event(r, tutors) or "Registered Tutor"
         month = month_label(r.get("timestamp"))
         key = (tutor, month)
         by_month_tutor.setdefault(key, []).append(r)
@@ -335,7 +348,7 @@ def write_daily_records(students, tutors, marks, smart, audit, completed, rate):
         write_rows(day, "smart_cards_records.csv", g["smart"])
         write_rows(day, "tutor_activity.csv", g["activity"])
         salary_rows = [{
-            "Completed At": r.get("timestamp", ""), "Tutor": tutor_name_from_event(r),
+            "Completed At": r.get("timestamp", ""), "Tutor": tutor_name_from_event(r, tutors),
             "University ID": r.get("university_id", ""), "Department": r.get("department", ""),
             "Semester": r.get("semester", ""), "Salary (₹)": float(rate),
         } for r in g["completed"]]
