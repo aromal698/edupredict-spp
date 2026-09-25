@@ -1,4 +1,6 @@
 import json
+import os
+import re
 from datetime import datetime
 import pandas as pd
 import streamlit as st
@@ -172,6 +174,109 @@ def build_tutor_summary(tutors, marks, audit):
     return pd.DataFrame(out)
 
 
+
+def safe_folder_name(value, fallback="Unknown"):
+    value = str(value or "").strip() or fallback
+    return re.sub(r"[^A-Za-z0-9._ -]+", "_", value).strip()[:80] or fallback
+
+
+def parse_event_dt(value):
+    try:
+        ts = pd.to_datetime(value, errors="coerce", utc=True)
+        return ts
+    except Exception:
+        return pd.NaT
+
+
+def month_label(value):
+    ts = parse_event_dt(value)
+    if pd.isna(ts):
+        return "Unknown Month"
+    return ts.strftime("%Y-%m")
+
+
+def build_folder_records(students, tutors, marks, smart, audit, completed, rate):
+    """Build department/semester virtual folders and monthly tutor salary folders."""
+    folders = {}
+
+    def ensure(dept, sem):
+        dept = str(dept or "Unknown").strip() or "Unknown"
+        sem = str(sem or "Unknown").strip().upper() or "Unknown"
+        key = (dept, sem)
+        folders.setdefault(key, {"students": [], "tutors": [], "marks": [], "smart": [], "audit": [], "analysis": {}})
+        return folders[key]
+
+    for r in students:
+        ensure(r.get("department"), r.get("semester"))["students"].append(r)
+    for r in tutors:
+        ensure(r.get("department"), r.get("semester"))["tutors"].append(r)
+    for r in marks:
+        ensure(r.get("department"), r.get("semester"))["marks"].append(r)
+    for r in smart:
+        ensure(r.get("department"), r.get("semester"))["smart"].append(r)
+    for r in audit:
+        if str(r.get("role", "")).strip().lower() == "tutor":
+            ensure(r.get("department"), r.get("semester"))["audit"].append(r)
+
+    for (dept, sem), g in folders.items():
+        done = [r for r in completed if str(r.get("department", "")).strip() == dept and str(r.get("semester", "")).strip().upper() == sem]
+        pending_scope = [r for r in extract_pending(audit) if str(r.get("department", "")).strip() == dept and str(r.get("semester", "")).strip().upper() == sem]
+        g["analysis"] = {
+            "Students": len(g["students"]),
+            "Tutors": len(g["tutors"]),
+            "Mark Records": len(g["marks"]),
+            "Smart Cards": len(g["smart"]),
+            "Completed Uploads": len(done),
+            "Pending Uploads": len(pending_scope),
+            "Salary": len(done) * float(rate),
+        }
+    return folders
+
+
+def write_runtime_folders(folders, completed, rate):
+    """Create an organized runtime export tree. Supabase remains the permanent source of truth."""
+    root = os.path.join(os.getcwd(), "principal_records")
+    os.makedirs(root, exist_ok=True)
+    for (dept, sem), g in folders.items():
+        base = os.path.join(root, safe_folder_name(dept), f"Semester_{safe_folder_name(sem)}")
+        for sub in ("Students", "Tutors", "Analysis"):
+            os.makedirs(os.path.join(base, sub), exist_ok=True)
+        for filename, data in (
+            ("students_records.csv", g["students"]),
+            ("tutors_records.csv", g["tutors"]),
+            ("marks_records.csv", g["marks"]),
+            ("smart_cards_records.csv", g["smart"]),
+            ("tutor_activity.csv", g["audit"]),
+        ):
+            target = os.path.join(base, "Students" if filename.startswith(("students", "marks", "smart")) else "Tutors", filename)
+            pd.DataFrame(data).to_csv(target, index=False)
+        pd.DataFrame([g["analysis"]]).to_csv(os.path.join(base, "Analysis", "department_semester_analysis.csv"), index=False)
+
+    # Tutor salary folders: Tutor Name / YYYY-MM
+    salary_root = os.path.join(root, "Tutor Salary")
+    os.makedirs(salary_root, exist_ok=True)
+    by_month_tutor = {}
+    for r in completed:
+        tutor = tutor_name_from_event(r) or "Unknown"
+        month = month_label(r.get("timestamp"))
+        key = (tutor, month)
+        by_month_tutor.setdefault(key, []).append(r)
+    for (tutor, month), records in by_month_tutor.items():
+        d = os.path.join(salary_root, safe_folder_name(tutor), month)
+        os.makedirs(d, exist_ok=True)
+        rows_out = [{
+            "Completed At": r.get("timestamp", ""), "Tutor": tutor,
+            "University ID": r.get("university_id", ""), "Department": r.get("department", ""),
+            "Semester": r.get("semester", ""), "Salary (₹)": float(rate),
+        } for r in records]
+        pd.DataFrame(rows_out).to_csv(os.path.join(d, "monthly_salary.csv"), index=False)
+
+    return root
+
+
+def folder_dataframe(data):
+    return pd.DataFrame(data) if data else pd.DataFrame()
+
 def login():
     st.title("🛡️ EduPredict SPP — Principal Portal")
     st.caption("Live Tutor monitoring • Completed work • Salary analysis • Student monitoring")
@@ -230,8 +335,8 @@ def dashboard():
 
     st.success("🟢 LIVE: Tutor completion records are read from the same Supabase database used by the Student/Tutor app.")
 
-    tab1, tab2, tab3 = st.tabs([
-        "👨‍🏫 Live Tutor Activity", "💰 Tutor Salary Analysis", "🪪 Smart Cards"
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "👨‍🏫 Live Tutor Activity", "💰 Tutor Salary Analysis", "🪪 Smart Cards", "📁 Academic Folders"
     ])
 
     with tab1:
@@ -276,6 +381,28 @@ def dashboard():
             y.metric("⏳ Pending Uploads", int(salary["Pending Uploads"].sum()))
             z.metric("💰 Total Tutor Salary", f"₹{total:,.2f}")
             st.caption("Salary rule: each completed student mark upload = 1 salary unit. The unit is counted only for the tutor's assigned department + selected semester. Pending uploads receive no salary.")
+
+        st.subheader("📅 Monthly Salary — Tutor / Month")
+        if completed:
+            monthly_rows = []
+            for r in completed:
+                monthly_rows.append({
+                    "Month": month_label(r.get("timestamp")),
+                    "Tutor Name": tutor_name_from_event(r),
+                    "Department": r.get("department", ""),
+                    "Semester": str(r.get("semester", "")).upper(),
+                    "Completed Uploads": 1,
+                    "Salary (₹)": float(rate),
+                })
+            monthly = pd.DataFrame(monthly_rows).groupby(
+                ["Month", "Tutor Name", "Department", "Semester"], as_index=False
+            ).agg({"Completed Uploads": "sum", "Salary (₹)": "sum"}).sort_values(
+                ["Month", "Tutor Name"], ascending=[False, True]
+            )
+            st.dataframe(monthly, use_container_width=True, hide_index=True)
+            st.download_button("📥 Download Monthly Tutor Salary", monthly.to_csv(index=False).encode(), "monthly_tutor_salary.csv", "text/csv")
+        else:
+            st.info("No completed tutor work for monthly salary yet.")
 
         st.subheader("✅ Completed Work Details")
         if completed:
@@ -342,6 +469,70 @@ def dashboard():
             st.dataframe(tutor_df,use_container_width=True,hide_index=True)
         else:
             st.info("No tutor profiles available yet.")
+
+
+    with tab4:
+        st.subheader("📁 Department → Semester → Students / Tutors / Analysis")
+        st.caption("Folders are generated dynamically from the live Supabase records. Each department and semester gets separate Student, Tutor and Analysis sections.")
+        rate_for_folders = float(rate) if "rate" in locals() else 100.0
+        folders = build_folder_records(students, tutors, marks, smart, audit, completed, rate_for_folders)
+        runtime_root = write_runtime_folders(folders, completed, rate_for_folders)
+
+        if not folders:
+            st.info("No department/semester records are available yet.")
+        else:
+            dept_names = sorted({d for d, _ in folders})
+            selected_dept = st.selectbox("📂 Department Folder", dept_names, key="principal_folder_dept")
+            sem_names = sorted({s for d, s in folders if d == selected_dept})
+            selected_sem = st.selectbox("📁 Semester Folder", sem_names, key="principal_folder_sem")
+            g = folders[(selected_dept, selected_sem)]
+
+            st.markdown(f"### 📂 {selected_dept} / 📁 Semester {selected_sem}")
+            f1, f2, f3, f4, f5 = st.tabs(["👨‍🎓 Students", "👨‍🏫 Tutors", "📝 Marks", "📊 Analysis", "🪪 Smart Cards"])
+            with f1:
+                df = folder_dataframe(g["students"])
+                st.dataframe(df, use_container_width=True, hide_index=True) if not df.empty else st.info("No students in this folder.")
+            with f2:
+                df = folder_dataframe(g["tutors"])
+                st.dataframe(df, use_container_width=True, hide_index=True) if not df.empty else st.info("No tutors in this folder.")
+            with f3:
+                df = folder_dataframe(g["marks"])
+                st.dataframe(df, use_container_width=True, hide_index=True) if not df.empty else st.info("No mark records in this folder.")
+            with f4:
+                st.dataframe(pd.DataFrame([g["analysis"]]), use_container_width=True, hide_index=True)
+                st.caption("Analysis is scoped to this department + semester.")
+            with f5:
+                df = folder_dataframe(g["smart"])
+                st.dataframe(df, use_container_width=True, hide_index=True) if not df.empty else st.info("No Smart Cards in this folder.")
+
+            st.divider()
+            st.subheader("💰 Tutor Salary Folders")
+            salary_records = []
+            for r in completed:
+                salary_records.append({
+                    "Tutor Name": tutor_name_from_event(r),
+                    "Month": month_label(r.get("timestamp")),
+                    "Department": r.get("department", ""),
+                    "Semester": str(r.get("semester", "")).upper(),
+                    "Completed Uploads": 1,
+                    "Salary (₹)": rate_for_folders,
+                })
+            if salary_records:
+                sdf = pd.DataFrame(salary_records).groupby(
+                    ["Tutor Name", "Month", "Department", "Semester"], as_index=False
+                ).agg({"Completed Uploads":"sum", "Salary (₹)":"sum"}).sort_values(
+                    ["Tutor Name", "Month"], ascending=[True, False]
+                )
+                tutor_names = sorted(sdf["Tutor Name"].unique().tolist())
+                selected_tutor = st.selectbox("👨‍🏫 Tutor Salary Folder", tutor_names, key="salary_folder_tutor")
+                tutor_months = sdf[sdf["Tutor Name"] == selected_tutor]
+                st.markdown(f"**📂 Tutor Salary / {selected_tutor}**")
+                st.dataframe(tutor_months, use_container_width=True, hide_index=True)
+                st.download_button("📥 Download Tutor Monthly Salary Folder Data", tutor_months.to_csv(index=False).encode(), f"{safe_folder_name(selected_tutor)}_monthly_salary.csv", "text/csv")
+            else:
+                st.info("No completed tutor salary records yet.")
+
+            st.caption(f"Runtime folder tree created at: `{runtime_root}`. Supabase remains the permanent database; Streamlit Cloud runtime folders can reset on redeploy/restart.")
 
 
 if "principal_auth" not in st.session_state:
