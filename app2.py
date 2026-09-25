@@ -14,6 +14,45 @@ st.set_page_config(page_title="EduPredict SPP • Principal", page_icon="🛡️
 PRINCIPAL_USERNAME = "Principal"
 PRINCIPAL_PASSWORD = "2026"
 
+def inject_principal_css():
+    st.markdown("""
+    <style>
+    .stApp { min-height:100vh; color:#eef6ff; background:#020817; overflow-x:hidden; }
+    .stApp::before {
+      content:""; position:fixed; inset:-20%; z-index:-5; pointer-events:none;
+      background:
+        radial-gradient(circle at 12% 18%, rgba(14,165,233,.30), transparent 22%),
+        radial-gradient(circle at 88% 22%, rgba(37,99,235,.28), transparent 24%),
+        radial-gradient(circle at 55% 92%, rgba(59,130,246,.22), transparent 27%),
+        linear-gradient(125deg,#020817,#06285d 50%,#020817);
+      animation: pbg 15s ease-in-out infinite alternate;
+    }
+    .principal-wallpaper { position:fixed; inset:0; z-index:-3; pointer-events:none; overflow:hidden; perspective:1100px; }
+    .p-orb { position:absolute; border-radius:50%; transform-style:preserve-3d; filter:blur(.4px); mix-blend-mode:screen; }
+    .p-a { width:270px;height:270px;left:5%;top:14%; background:radial-gradient(circle at 28% 25%,#fff,#38bdf8 10%,#2563eb 38%,transparent 72%); box-shadow:0 0 100px rgba(14,165,233,.28); animation: pa 12s ease-in-out infinite; }
+    .p-b { width:330px;height:330px;right:2%;top:8%; background:radial-gradient(circle at 30% 25%,#fff,#60a5fa 9%,#1d4ed8 38%,transparent 72%); box-shadow:0 0 110px rgba(37,99,235,.28); animation: pb 16s ease-in-out infinite; }
+    .p-c { width:190px;height:190px;right:27%;bottom:2%; background:radial-gradient(circle at 30% 25%,#fff,#7dd3fc 9%,#0284c7 38%,transparent 72%); animation: pc 10s ease-in-out infinite; }
+    .p-ring { position:absolute; border:1px solid rgba(125,211,252,.22); border-radius:50%; transform-style:preserve-3d; }
+    .p-ring.one { width:520px;height:520px;left:-180px;bottom:-250px; transform:rotateX(68deg); animation: ring 20s linear infinite; }
+    .p-ring.two { width:600px;height:600px;right:-240px;top:25%; transform:rotateY(70deg); animation:ring2 25s linear infinite; }
+    .p-cube { position:absolute; width:90px;height:90px;right:23%;top:39%; transform-style:preserve-3d; animation:cube 14s linear infinite; opacity:.32; }
+    .p-cube i { position:absolute; inset:0; border:1px solid rgba(125,211,252,.6); background:rgba(59,130,246,.05); }
+    .p-cube i:nth-child(1){transform:translateZ(45px)} .p-cube i:nth-child(2){transform:rotateY(180deg) translateZ(45px)} .p-cube i:nth-child(3){transform:rotateY(90deg) translateZ(45px)} .p-cube i:nth-child(4){transform:rotateY(-90deg) translateZ(45px)} .p-cube i:nth-child(5){transform:rotateX(90deg) translateZ(45px)} .p-cube i:nth-child(6){transform:rotateX(-90deg) translateZ(45px)}
+    @keyframes pbg{from{transform:scale(1)}to{transform:scale(1.07) rotate(.5deg)}}
+    @keyframes pa{0%,100%{transform:translate3d(0,0,0)}50%{transform:translate3d(100px,40px,150px)}}
+    @keyframes pb{0%,100%{transform:translate3d(0,0,0)}50%{transform:translate3d(-80px,80px,-80px)}}
+    @keyframes pc{0%,100%{transform:translate3d(0,0,0)}50%{transform:translate3d(-120px,-40px,120px) scale(1.12)}}
+    @keyframes ring{to{transform:rotateX(68deg) rotateZ(360deg)}} @keyframes ring2{to{transform:rotateY(70deg) rotateZ(-360deg)}}
+    @keyframes cube{to{transform:rotateX(360deg) rotateY(360deg) rotateZ(180deg)}}
+    .block-container{position:relative;z-index:2;max-width:1250px;padding-top:2rem;}
+    .glass-panel{padding:22px;border-radius:22px;border:1px solid rgba(147,197,253,.16);background:rgba(3,15,38,.70);backdrop-filter:blur(16px);box-shadow:0 24px 70px rgba(0,0,0,.30);}
+    .smart-preview{max-width:520px;margin:auto;padding:22px;border-radius:22px;background:linear-gradient(135deg,#06142e,#0b4aa2,#123f8f);border:1px solid rgba(191,219,254,.25);box-shadow:0 22px 70px rgba(0,0,0,.35);font-weight:700;}
+    @media (prefers-reduced-motion:reduce){.stApp::before,.principal-wallpaper *{animation:none!important}}
+    </style>
+    <div class="principal-wallpaper" aria-hidden="true"><div class="p-orb p-a"></div><div class="p-orb p-b"></div><div class="p-orb p-c"></div><div class="p-ring one"></div><div class="p-ring two"></div><div class="p-cube"><i></i><i></i><i></i><i></i><i></i><i></i></div></div>
+    """, unsafe_allow_html=True)
+
+
 
 def secret_value(*names):
     for name in names:
@@ -61,14 +100,22 @@ def parse_subjects(value):
     return []
 
 
-def extract_completed(audit):
-    return [r for r in audit if str(r.get("role", "")).strip().lower() == "tutor"
-            and str(r.get("action", "")).strip() == "Tutor Work Completed"]
+def _latest_work_state(audit):
+    """Return the latest tutor completion state per tutor + student + scope."""
+    events=[r for r in audit if str(r.get("role","")).strip().lower()=="tutor" and str(r.get("action","")).strip() in {"Tutor Work Completed","Tutor Work Saved - Pending Completion"}]
+    latest={}
+    for r in events:
+        key=(str(r.get("username","")).strip().lower(),str(r.get("university_id","")).strip().lower(),str(r.get("department","")).strip().lower(),str(r.get("semester","")).strip().upper())
+        stamp=str(r.get("timestamp", ""))
+        if key not in latest or stamp >= str(latest[key].get("timestamp", "")):
+            latest[key]=r
+    return list(latest.values())
 
+def extract_completed(audit):
+    return [r for r in _latest_work_state(audit) if str(r.get("action","")).strip()=="Tutor Work Completed"]
 
 def extract_pending(audit):
-    return [r for r in audit if str(r.get("role", "")).strip().lower() == "tutor"
-            and str(r.get("action", "")).strip() == "Tutor Work Saved - Pending Completion"]
+    return [r for r in _latest_work_state(audit) if str(r.get("action","")).strip()=="Tutor Work Saved - Pending Completion"]
 
 
 def credit_from_subjects(subjects):
@@ -146,8 +193,14 @@ def login():
 
 
 def dashboard():
+    inject_principal_css()
+    try:
+        from streamlit_autorefresh import st_autorefresh
+        st_autorefresh(interval=15000, key="principal_live_refresh")
+    except Exception:
+        pass
     st.title("🛡️ Principal Academic Monitoring")
-    st.caption("Shared Supabase database • " + datetime.now().strftime("%d %b %Y, %I:%M:%S %p"))
+    st.caption("LIVE shared Supabase • Tutor actions + completed work + salary + Smart Cards • " + datetime.now().strftime("%d %b %Y, %I:%M:%S %p"))
 
     c1, c2 = st.columns([1, 5])
     if c1.button("🚪 Logout"):
@@ -182,8 +235,8 @@ def dashboard():
 
     st.success("🟢 LIVE: Tutor completion records are read from the same Supabase database used by the Student/Tutor app.")
 
-    tab1, tab2, tab3, tab4 = st.tabs([
-        "👨‍🏫 Live Tutor Activity", "💰 Tutor Salary Analysis", "🪪 Smart Cards", "🏫 Students"
+    tab1, tab2, tab3 = st.tabs([
+        "👨‍🏫 Live Tutor Activity", "💰 Tutor Salary Analysis", "🪪 Smart Cards"
     ])
 
     with tab1:
@@ -246,6 +299,9 @@ def dashboard():
     with tab3:
         st.subheader("🪪 Smart Card Monitoring")
         if smart:
+            st.caption("Smart Card preview is kept compact while using large, readable text.")
+            latest_card = smart[0]
+            st.markdown(f"<div class='smart-preview'><div style='font-size:.8rem;letter-spacing:.12em;color:#bfdbfe'>EDUPREDICT SPP • STUDENT SMART CARD</div><div style='font-size:1.65rem;margin-top:8px'>{latest_card.get('name','')}</div><div style='font-family:monospace;font-size:1.15rem;margin-top:4px'>{latest_card.get('registration_id','')}</div><div style='margin-top:14px;font-size:1rem;line-height:1.65'>University ID: {latest_card.get('university_id','')}<br>DOB: {latest_card.get('dob','')} • Blood: {latest_card.get('blood_group','')}<br>{latest_card.get('department','')} • {latest_card.get('semester','')}</div></div>", unsafe_allow_html=True)
             sdf = pd.DataFrame([{
                 "Registration ID": r.get("registration_id", ""), "Name": r.get("name", ""),
                 "University ID": r.get("university_id", ""), "DOB": r.get("dob", ""),
@@ -258,19 +314,6 @@ def dashboard():
             st.dataframe(sdf, use_container_width=True, hide_index=True)
         else:
             st.info("No Smart Cards registered yet.")
-
-    with tab4:
-        st.subheader("🏫 Student Monitoring")
-        if students:
-            sdf = pd.DataFrame([{
-                "University ID": r.get("university_id", ""), "Student Name": r.get("student_name", ""),
-                "Department": r.get("department", ""), "Semester": r.get("semester", ""),
-                "Studied College": r.get("studied_college", ""), "Registered By": r.get("registered_by", ""),
-                "Active": r.get("active", True), "Registered At": r.get("registered_at", ""),
-            } for r in students])
-            st.dataframe(sdf, use_container_width=True, hide_index=True)
-        else:
-            st.info("No students registered yet.")
 
 
 if "principal_auth" not in st.session_state:
