@@ -507,8 +507,8 @@ def dashboard():
 
     st.success("🟢 LIVE: Tutor completion records are read from the same Supabase database used by the Student/Tutor app.")
 
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-        "👨‍🏫 Live Tutor Activity", "💰 Tutor Salary Analysis", "🪪 Smart Cards", "📁 Academic Folders", "📅 Daily Records", "🗑️ Delete Student"
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+        "👁️ Monitoring", "💰 Salary", "📱 Normal App", "🪪 Smart Cards", "📁 Academic Folders", "📅 Daily Records", "🗑️ Delete Student"
     ])
 
     with tab1:
@@ -632,6 +632,85 @@ def dashboard():
             st.info("No Tutor work has been marked Completed yet.")
 
     with tab3:
+        st.subheader("📱 Normal App — Principal View")
+        st.caption("This is the simple day-to-day app view: Students, Tutors, Marks/Results and search. Monitoring stays in the first tab.")
+
+        n1, n2, n3, n4 = st.tabs(["👨‍🎓 Students", "👨‍🏫 Tutors", "📝 Marks & Results", "🔎 Student Search"])
+
+        with n1:
+            st.subheader("👨‍🎓 Student Registration Records")
+            if students:
+                df = pd.DataFrame([{
+                    "University ID": r.get("university_id", ""),
+                    "Student Name": r.get("student_name", ""),
+                    "Department": r.get("department", ""),
+                    "Semester": r.get("semester", ""),
+                    "Studied College": r.get("studied_college", ""),
+                    "Registered By": r.get("registered_by", ""),
+                    "Registered At": r.get("registered_at", "")
+                } for r in students])
+                st.dataframe(df, use_container_width=True, hide_index=True)
+                st.download_button("📥 Download Student Records", df.to_csv(index=False).encode(), "student_records.csv", "text/csv", use_container_width=True)
+            else:
+                st.info("No students registered yet.")
+
+        with n2:
+            st.subheader("👨‍🏫 Tutor Records")
+            if tutors:
+                df = pd.DataFrame([{
+                    "Tutor Name": r.get("tutor_name", ""),
+                    "Department": r.get("department", ""),
+                    "Semester": r.get("semester", "") or "All",
+                    "Credit Score": r.get("credit_score", 0),
+                    "Active": r.get("active", True),
+                    "Registered At": r.get("registered_at", "")
+                } for r in tutors])
+                st.dataframe(df, use_container_width=True, hide_index=True)
+                st.download_button("📥 Download Tutor Records", df.to_csv(index=False).encode(), "tutor_records.csv", "text/csv", use_container_width=True)
+            else:
+                st.info("No tutors registered yet.")
+
+        with n3:
+            st.subheader("📝 Student Marks / Results")
+            if marks:
+                rows = []
+                for r in marks:
+                    rows.append({
+                        "Submitted At": r.get("submitted_at", ""),
+                        "University ID": r.get("university_id", ""),
+                        "Department": r.get("department", ""),
+                        "Semester": r.get("semester", ""),
+                        "Tutor": r.get("tutor_name", ""),
+                        "Subjects / Marks": str(r.get("subjects", ""))
+                    })
+                df = pd.DataFrame(rows)
+                st.dataframe(df, use_container_width=True, hide_index=True)
+                st.download_button("📥 Download Marks Records", df.to_csv(index=False).encode(), "marks_records.csv", "text/csv", use_container_width=True)
+            else:
+                st.info("No marks have been entered yet.")
+
+        with n4:
+            st.subheader("🔎 Search Student Profile")
+            if students:
+                options = {f"{r.get('university_id','')} — {r.get('student_name','')}": r for r in students}
+                selected = st.selectbox("Select Student", list(options.keys()), key="principal_normal_student_search")
+                student = options[selected]
+                c1, c2 = st.columns(2)
+                c1.metric("University ID", str(student.get("university_id", "")))
+                c2.metric("Department / Semester", f"{student.get('department','')} / {student.get('semester','')}")
+                st.write(f"**Name:** {student.get('student_name','')}")
+                st.write(f"**Studied College:** {student.get('studied_college','') or '—'}")
+                st.write(f"**Registered By:** {student.get('registered_by','') or '—'}")
+                st.write(f"**Registered At:** {student.get('registered_at','') or '—'}")
+
+                student_marks = [m for m in marks if str(m.get('university_id','')).strip() == str(student.get('university_id','')).strip()]
+                if student_marks:
+                    st.subheader("📊 This Student's Mark Records")
+                    st.dataframe(pd.DataFrame(student_marks), use_container_width=True, hide_index=True)
+            else:
+                st.info("No students available for search.")
+
+    with tab4:
         st.subheader("🪪 Smart Card + Full Student Monitoring")
         st.caption("Principal can see the complete Smart Card details, student profile, tutor directory, and live tutor work from the shared database.")
         if smart:
@@ -684,7 +763,7 @@ def dashboard():
             st.info("No tutor profiles available yet.")
 
 
-    with tab4:
+    with tab5:
         st.subheader("📁 Department → Semester → Students / Tutors / Analysis")
         st.caption("Folders are generated dynamically from the live Supabase records. Each department and semester gets separate Student, Tutor and Analysis sections.")
         rate_for_folders = float(rate) if "rate" in locals() else 100.0
@@ -793,7 +872,7 @@ def dashboard():
         st.caption(f"Daily files are generated under `{daily_root}` on the current Streamlit runtime. Supabase is the permanent source of truth.")
 
 
-    with tab6:
+    with tab7:
         st.subheader("🗑️ Delete Student — One at a Time")
         st.warning("⚠️ Permanent deletion: this removes the selected student's registration, marks/results, Smart Card, uploaded student files, old tutor activity, daily Principal records and related Supabase records. A new deletion audit entry is kept.")
         if not students:
