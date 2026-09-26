@@ -264,7 +264,7 @@ def build_folder_records(students, tutors, marks, smart, audit, completed, rate)
     return folders
 
 
-def write_runtime_folders(folders, completed, rate):
+def write_runtime_folders(folders, completed, rate, tutors):
     """Create an organized runtime export tree. Supabase remains the permanent source of truth."""
     root = os.path.join(os.getcwd(), "principal_records")
     os.makedirs(root, exist_ok=True)
@@ -503,11 +503,6 @@ def delete_all_principal_history(sb):
 
 def dashboard():
     inject_principal_css()
-    try:
-        from streamlit_autorefresh import st_autorefresh
-        st_autorefresh(interval=30*60*1000, key="principal_30min_refresh")
-    except Exception:
-        pass
     st.title("🛡️ Principal Academic Monitoring")
     st.caption("LIVE shared Supabase • Tutor actions + completed work + salary + Smart Cards • " + datetime.now().strftime("%d %b %Y, %I:%M:%S %p"))
 
@@ -742,7 +737,7 @@ def dashboard():
         st.caption("Folders are generated dynamically from the live Supabase records. Each department and semester gets separate Student, Tutor and Analysis sections.")
         rate_for_folders = float(rate) if "rate" in locals() else 100.0
         folders = build_folder_records(students, tutors, marks, smart, audit, completed, rate_for_folders)
-        runtime_root = write_runtime_folders(folders, completed, rate_for_folders)
+        runtime_root = write_runtime_folders(folders, completed, rate_for_folders, tutors)
 
         if not folders:
             st.info("No department/semester records are available yet.")
@@ -892,37 +887,11 @@ def dashboard():
 
 
 
-    # ------------------------------------------------------------
-    # FINAL HISTORY CONTROL — delete historical Principal activity
-    # ------------------------------------------------------------
-    st.divider()
-    st.subheader("🧹 Delete All Principal History")
-    st.warning("This clears audit/activity history, salary-credit transaction history, and generated day-by-day Principal history files. Current Students, Tutors, Marks and Smart Cards are NOT deleted.")
-    history_confirm=st.checkbox("I understand that ALL historical activity/salary history will be permanently deleted.",key="principal_delete_all_history_confirm")
-    if st.button("🧹 DELETE ALL HISTORY",type="primary",use_container_width=True,key="principal_delete_all_history_button",disabled=not history_confirm):
-        try:
-            errs=delete_all_principal_history(sb)
-            if errs:
-                st.error("Some history could not be deleted: " + " | ".join(errs))
-            else:
-                st.success("✅ All Principal history has been deleted. Current student/tutor records remain safe.")
-            st.session_state.pop("principal_delete_all_history_confirm",None)
-            st.rerun()
-        except Exception as exc:
-            st.error(f"❌ History deletion failed: {exc}")
+# Streamlit entry point
+if "principal_auth" not in st.session_state:
+    st.session_state.principal_auth = False
 
-
-def main():
-    """Main entry point for the Principal Streamlit application."""
-    if "principal_auth" not in st.session_state:
-        st.session_state.principal_auth = False
-
-    if not st.session_state.principal_auth:
-        login()
-    else:
-        dashboard()
-
-
-if __name__ == "__main__":
-    main()
-
+if not st.session_state.principal_auth:
+    login()
+else:
+    dashboard()
