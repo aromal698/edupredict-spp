@@ -443,6 +443,25 @@ def login():
             st.error("Invalid username or password.")
 
 
+def tutor_accounts_for_principal(sb):
+    try: return list(getattr(sb.table("tutor_accounts").select("*").order("tutor_name").execute(),"data",None) or [])
+    except Exception: return []
+
+def salary_transactions_for_principal(sb):
+    try: return list(getattr(sb.table("tutor_salary_transactions").select("*").order("sent_at",desc=True).execute(),"data",None) or [])
+    except Exception: return []
+
+def credit_tutor_salary(sb,account,amount,salary_month,reference):
+    email=str(account.get("email") or account.get("tutor_id") or "").strip().lower(); name=str(account.get("tutor_name") or "").strip(); amount=float(amount)
+    if not email or not name: raise ValueError("Tutor account is incomplete.")
+    if amount<=0: raise ValueError("Salary amount must be greater than ₹0.")
+    new_balance=float(account.get("balance") or 0)+amount
+    sb.table("tutor_accounts").update({"balance":new_balance}).eq("email",email).execute()
+    sb.table("tutor_salary_transactions").insert({"tutor_id":email,"tutor_name":name,"amount":amount,"salary_month":str(salary_month),"sent_by":PRINCIPAL_USERNAME,"reference":str(reference or "").strip(),"status":"credited"}).execute()
+    sb.table("audit_logs").insert({"username":PRINCIPAL_USERNAME,"role":"Principal","action":"Tutor Salary Credited","university_id":"","department":str(account.get("department") or ""),"semester":str(account.get("semester") or "").upper(),"details":f"Tutor={name}; Email={email}; Amount=₹{amount:.2f}; Month={salary_month}; Reference={reference}"}).execute()
+    return new_balance
+
+
 def dashboard():
     inject_principal_css()
     try:
@@ -465,6 +484,8 @@ def dashboard():
         sb.table("students").select("university_id").limit(1).execute()
         students = get_all("students", "registered_at")
         tutors = get_all("tutors", "registered_at")
+        tutor_accounts = tutor_accounts_for_principal(sb)
+        salary_transactions = salary_transactions_for_principal(sb)
         marks = get_all("student_marks", "submitted_at")
         smart = get_all("smart_cards", "submitted_at")
         audit = get_all("audit_logs", "timestamp")
@@ -549,6 +570,31 @@ def dashboard():
             x.metric("👨‍🏫 Tutors", len(salary_df))
             y.metric("👥 Students Completed", int(salary_df["Students Completed"].sum()))
             z.metric("💰 Total Salary", f"₹{salary_df['Salary (₹)'].sum():,.2f}")
+
+        st.subheader("💳 Send Salary to Tutor Account")
+        if tutor_accounts:
+            account_options={f"{a.get('tutor_name','')} — {a.get('department','')} — {a.get('semester','')}":a for a in tutor_accounts}
+            label=st.selectbox("Select tutor account",list(account_options.keys()),key="principal_salary_account")
+            account=account_options[label]
+            c1,c2,c3=st.columns(3)
+            amount=c1.number_input("Salary Amount (₹)",min_value=0.0,value=1000.0,step=100.0,key="principal_credit_amount")
+            salary_month=c2.text_input("Salary Month",value=datetime.now().strftime("%Y-%m"),key="principal_salary_month")
+            reference=c3.text_input("Reference / Note",placeholder="September salary",key="principal_salary_reference")
+            st.caption(f"Tutor account: **{account.get('tutor_name','')}**  •  Current balance: **₹{float(account.get('balance') or 0):,.2f}**")
+            if st.button("💸 Credit Salary to This Tutor Account",type="primary",use_container_width=True,key="credit_salary_button"):
+                try:
+                    new_balance=credit_tutor_salary(sb,account,amount,salary_month,reference)
+                    st.success(f"✅ ₹{amount:,.2f} credited to {account.get('tutor_name','')} salary account. New balance: ₹{new_balance:,.2f}")
+                    st.rerun()
+                except Exception as exc: st.error(f"❌ Salary credit failed: {exc}")
+            st.subheader("💰 Tutor Account Balances")
+            balances=pd.DataFrame([{"Tutor Name":a.get("tutor_name",""),"Department":a.get("department",""),"Semester":str(a.get("semester","")).upper(),"Account Balance (₹)":float(a.get("balance") or 0),"Account Created":a.get("created_at","")} for a in tutor_accounts])
+            st.dataframe(balances,use_container_width=True,hide_index=True)
+            if salary_transactions:
+                st.subheader("📜 Salary Credit History")
+                txdf=pd.DataFrame([{"Date":x.get("sent_at",""),"Tutor Name":x.get("tutor_name",""),"Month":x.get("salary_month",""),"Amount (₹)":float(x.get("amount") or 0),"Reference":x.get("reference",""),"Status":x.get("status","")} for x in salary_transactions])
+                st.dataframe(txdf,use_container_width=True,hide_index=True)
+        else: st.info("No email-based tutor accounts have been created yet. Create one from the 👤 circle icon on the Tutor Login page.")
 
         st.subheader("📅 Monthly Salary — Every Tutor")
         if completed:
