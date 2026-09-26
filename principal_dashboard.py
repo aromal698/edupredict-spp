@@ -1,8 +1,9 @@
-"""
-Principal Dashboard Launcher
+"""Principal Dashboard entry point.
 
 Run:
     streamlit run principal_dashboard.py
+
+The actual Principal application is app2.py.
 """
 
 import app2
