@@ -1,11 +1,12 @@
-"""Principal Dashboard entry point.
-Run with:
-    streamlit run principal_dashboard.py
+"""
+Principal Dashboard Launcher
 
-The complete Principal UI is implemented in app2.py.
+Run:
+    streamlit run principal_dashboard.py
 """
 
 import app2
 
 
-app2.main()
+if __name__ == "__main__":
+    app2.main()
