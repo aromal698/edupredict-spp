@@ -507,7 +507,11 @@ def dashboard():
         st.caption("Folders are generated dynamically from the live Supabase records. Each department and semester gets separate Student, Tutor and Analysis sections.")
         rate_for_folders = float(rate) if "rate" in locals() else 100.0
         folders = build_folder_records(students, tutors, marks, smart, audit, completed, rate_for_folders)
-        runtime_root = write_runtime_folders(folders, completed, rate_for_folders)
+        try:
+            runtime_root = write_runtime_folders(folders, completed, rate_for_folders)
+        except Exception as folder_exc:
+            runtime_root = "Not written (dashboard data is still available)"
+            st.warning(f"⚠️ Runtime folder export skipped: {folder_exc}")
 
         if not folders:
             st.info("No department/semester records are available yet.")
@@ -610,6 +614,6 @@ def main():
         dashboard()
 
 
-if __name__ == "__main__":
-    main()
+# Streamlit entry point
+main()
 
