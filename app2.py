@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import re
 from datetime import datetime
 import pandas as pd
@@ -451,22 +452,60 @@ def salary_transactions_for_principal(sb):
     try: return list(getattr(sb.table("tutor_salary_transactions").select("*").order("sent_at",desc=True).execute(),"data",None) or [])
     except Exception: return []
 
-def credit_tutor_salary(sb,account,amount,salary_month,reference):
+def request_tutor_salary(sb, account, amount, salary_month, reference):
     email=str(account.get("email") or account.get("tutor_id") or "").strip().lower(); name=str(account.get("tutor_name") or "").strip(); amount=float(amount)
     if not email or not name: raise ValueError("Tutor account is incomplete.")
     if amount<=0: raise ValueError("Salary amount must be greater than ₹0.")
-    new_balance=float(account.get("balance") or 0)+amount
+    payload={"tutor_id":email,"tutor_name":name,"amount":amount,"salary_month":str(salary_month),"sent_by":PRINCIPAL_USERNAME,"reference":str(reference or "").strip(),"status":"pending"}
+    data=rows(sb.table("tutor_salary_transactions").insert(payload).execute())
+    if not data: raise RuntimeError("Salary request could not be created.")
+    sb.table("audit_logs").insert({"username":PRINCIPAL_USERNAME,"role":"Principal","action":"Tutor Salary Approval Requested","university_id":"","department":str(account.get("department") or ""),"semester":str(account.get("semester") or "").upper(),"details":f"Tutor={name}; Email={email}; Amount=₹{amount:.2f}; Month={salary_month}; Reference={reference}"}).execute()
+    return data[0]
+
+
+def approve_tutor_salary(sb, transaction):
+    txid=transaction.get("id")
+    if txid is None: raise ValueError("Salary transaction ID is missing.")
+    if str(transaction.get("status","")).lower() != "pending": raise ValueError("This salary request is already processed.")
+    email=str(transaction.get("tutor_id") or "").strip().lower(); amount=float(transaction.get("amount") or 0)
+    account_rows=rows(sb.table("tutor_accounts").select("*").eq("email",email).limit(1).execute())
+    if not account_rows: raise ValueError("Tutor salary account was not found.")
+    account=account_rows[0]; new_balance=float(account.get("balance") or 0)+amount
     sb.table("tutor_accounts").update({"balance":new_balance}).eq("email",email).execute()
-    sb.table("tutor_salary_transactions").insert({"tutor_id":email,"tutor_name":name,"amount":amount,"salary_month":str(salary_month),"sent_by":PRINCIPAL_USERNAME,"reference":str(reference or "").strip(),"status":"credited"}).execute()
-    sb.table("audit_logs").insert({"username":PRINCIPAL_USERNAME,"role":"Principal","action":"Tutor Salary Credited","university_id":"","department":str(account.get("department") or ""),"semester":str(account.get("semester") or "").upper(),"details":f"Tutor={name}; Email={email}; Amount=₹{amount:.2f}; Month={salary_month}; Reference={reference}"}).execute()
+    sb.table("tutor_salary_transactions").update({"status":"credited"}).eq("id",txid).eq("status","pending").execute()
+    sb.table("audit_logs").insert({"username":PRINCIPAL_USERNAME,"role":"Principal","action":"Tutor Salary Approved and Credited","university_id":"","department":str(account.get("department") or ""),"semester":str(account.get("semester") or "").upper(),"details":f"Tutor={transaction.get('tutor_name','')}; Email={email}; Amount=₹{amount:.2f}; Month={transaction.get('salary_month','')}; Reference={transaction.get('reference','')}"}).execute()
     return new_balance
+
+
+def delete_all_principal_history(sb):
+    """Delete historical activity/salary history and runtime day-by-day exports.
+    Current student/tutor master records are intentionally preserved.
+    """
+    errors=[]
+    for table in ("audit_logs", "tutor_salary_transactions"):
+        try:
+            # Supabase requires a filter for safe deletes. `id`/`tutor_id`
+            # non-null filters match every existing row in these history tables.
+            if table == "audit_logs":
+                sb.table(table).delete().gt("id", 0).execute()
+            else:
+                sb.table(table).delete().gt("id", 0).execute()
+        except Exception as exc:
+            errors.append(f"{table}: {exc}")
+    runtime_root=os.path.join(os.getcwd(),"principal_records","Daily Records")
+    try:
+        if os.path.isdir(runtime_root):
+            shutil.rmtree(runtime_root)
+    except Exception as exc:
+        errors.append(f"runtime daily records: {exc}")
+    return errors
 
 
 def dashboard():
     inject_principal_css()
     try:
         from streamlit_autorefresh import st_autorefresh
-        st_autorefresh(interval=30*60_000, key="principal_30min_refresh")
+        st_autorefresh(interval=30*60*1000, key="principal_30min_refresh")
     except Exception:
         pass
     st.title("🛡️ Principal Academic Monitoring")
@@ -581,14 +620,26 @@ def dashboard():
             salary_month=c2.text_input("Salary Month",value=datetime.now().strftime("%Y-%m"),key="principal_salary_month")
             reference=c3.text_input("Reference / Note",placeholder="September salary",key="principal_salary_reference")
             st.caption(f"Tutor account: **{account.get('tutor_name','')}**  •  Current balance: **₹{float(account.get('balance') or 0):,.2f}**")
-            approve = st.checkbox("✅ I approve this salary payment and want to credit it to the tutor account.", key="principal_salary_approval")
-            if st.button("💸 APPROVE & CREDIT SALARY",type="primary",use_container_width=True,key="credit_salary_button",disabled=not approve):
+            if st.button("📨 Send Salary for Approval",use_container_width=True,key="request_salary_button"):
                 try:
-                    new_balance=credit_tutor_salary(sb,account,amount,salary_month,reference)
-                    st.success(f"✅ Salary approved and credited: ₹{amount:,.2f} → {account.get('tutor_name','')} • New balance: ₹{new_balance:,.2f}")
-                    st.session_state.pop("principal_salary_approval",None)
+                    request_tutor_salary(sb,account,amount,salary_month,reference)
+                    st.success("✅ Salary request created. Principal approval is required before the balance changes.")
                     st.rerun()
-                except Exception as exc: st.error(f"❌ Salary credit failed: {exc}")
+                except Exception as exc: st.error(f"❌ Salary request failed: {exc}")
+            pending_salary=[x for x in salary_transactions if str(x.get("status","")).lower()=="pending"]
+            st.subheader("⏳ Pending Salary Approvals")
+            if pending_salary:
+                pending_options={f"#{x.get('id')} — {x.get('tutor_name','')} — ₹{float(x.get('amount') or 0):,.2f}":x for x in pending_salary}
+                pending_label=st.selectbox("Select salary request",list(pending_options.keys()),key="principal_pending_salary")
+                selected_tx=pending_options[pending_label]
+                if st.button("✅ APPROVE & CREDIT TO TUTOR ACCOUNT",type="primary",use_container_width=True,key="approve_salary_button"):
+                    try:
+                        new_balance=approve_tutor_salary(sb,selected_tx)
+                        st.success(f"✅ Approved and credited ₹{float(selected_tx.get('amount') or 0):,.2f} to {selected_tx.get('tutor_name','')}. Balance: ₹{new_balance:,.2f}")
+                        st.rerun()
+                    except Exception as exc: st.error(f"❌ Salary approval failed: {exc}")
+            else:
+                st.info("No pending salary approvals.")
             st.subheader("💰 Tutor Account Balances")
             balances=pd.DataFrame([{"Tutor Name":a.get("tutor_name",""),"Department":a.get("department",""),"Semester":str(a.get("semester","")).upper(),"Account Balance (₹)":float(a.get("balance") or 0),"Account Created":a.get("created_at","")} for a in tutor_accounts])
             st.dataframe(balances,use_container_width=True,hide_index=True)
@@ -762,33 +813,6 @@ def dashboard():
         st.caption("Every day is kept separately as YYYY-MM-DD. The tables below are regenerated from the live Supabase database, so a deleted student is removed from the displayed records.")
         rate_for_daily = float(rate) if "rate" in locals() else 100.0
         daily_root, available_days = write_daily_records(students, tutors, marks, smart, audit, completed, rate_for_daily)
-        st.markdown("### 👨‍🎓 Students — Date-wise Records")
-        student_dates = {}
-        for r in students:
-            d = str(r.get("registered_at", ""))[:10] or "Unknown-Date"
-            student_dates.setdefault(d, []).append(r)
-        if student_dates:
-            for d in sorted(student_dates, reverse=True):
-                with st.expander(f"📅 {d} — {len(student_dates[d])} student(s)"):
-                    st.dataframe(pd.DataFrame([{
-                        "University ID":x.get("university_id",""),"Student Name":x.get("student_name",""),"Department":x.get("department",""),"Semester":x.get("semester",""),"Registered By":x.get("registered_by","")
-                    } for x in student_dates[d]]),use_container_width=True,hide_index=True)
-        else:
-            st.info("No student records available.")
-        st.markdown("### 👨‍🏫 Tutors — Date-wise Records")
-        tutor_dates = {}
-        for r in tutors:
-            d = str(r.get("registered_at", ""))[:10] or "Unknown-Date"
-            tutor_dates.setdefault(d, []).append(r)
-        if tutor_dates:
-            for d in sorted(tutor_dates, reverse=True):
-                with st.expander(f"📅 {d} — {len(tutor_dates[d])} tutor(s)"):
-                    st.dataframe(pd.DataFrame([{
-                        "Tutor Name":x.get("tutor_name",""),"Department":x.get("department",""),"Semester":x.get("semester","") or "All","Registered At":x.get("registered_at","")
-                    } for x in tutor_dates[d]]),use_container_width=True,hide_index=True)
-        else:
-            st.info("No tutor records available.")
-        st.divider()
         if not available_days:
             st.info("No dated records available yet.")
         else:
@@ -821,25 +845,19 @@ def dashboard():
 
         st.caption(f"Daily files are generated under `{daily_root}` on the current Streamlit runtime. Supabase is the permanent source of truth.")
 
-        st.divider()
-        st.subheader("🧹 Principal History Management")
-        st.warning("This removes historical audit/activity history and generated Principal daily/folder history. Current Students, Tutors, Marks, Smart Cards and Tutor Salary Accounts are NOT deleted.")
-        clear_history_confirm = st.checkbox("I understand that DELETE ALL HISTORY is permanent.", key="principal_delete_all_history_confirm")
-        if st.button("🗑️ DELETE ALL HISTORY", type="primary", use_container_width=True, key="principal_delete_all_history", disabled=not clear_history_confirm):
-            try:
-                sb.table("audit_logs").delete().neq("id", -1).execute()
-                runtime_root = os.path.join(os.getcwd(), "principal_records")
-                if os.path.isdir(runtime_root):
-                    import shutil
-                    shutil.rmtree(runtime_root, ignore_errors=True)
-                st.success("✅ All Principal historical audit/daily history has been deleted. Current records remain safe.")
-                st.session_state.pop("principal_delete_all_history_confirm", None)
-                st.rerun()
-            except Exception as exc:
-                st.error(f"❌ Could not delete all history: {exc}")
-
 
     with tab6:
+        st.subheader("🧹 Principal History Management")
+        st.warning("Delete ALL Principal history removes audit/activity history, salary transaction history and generated daily history files. Current Students, Tutors, Marks, Smart Cards and tutor account balances remain.")
+        history_confirm=st.checkbox("I understand this permanently deletes Principal history.",key="principal_delete_history_confirm")
+        if st.button("🗑️ DELETE ALL PRINCIPAL HISTORY",type="primary",use_container_width=True,disabled=not history_confirm,key="delete_all_principal_history"):
+            try:
+                errors=delete_all_principal_history(sb)
+                if errors: st.warning("History cleared with some warnings: " + " | ".join(errors))
+                else: st.success("✅ All Principal history deleted. Current records remain intact.")
+                st.rerun()
+            except Exception as exc: st.error(f"❌ History deletion failed: {exc}")
+        st.divider()
         st.subheader("🗑️ Delete Student — One at a Time")
         st.warning("⚠️ Permanent deletion: this removes the selected student's registration, marks/results, Smart Card, uploaded student files, old tutor activity, daily Principal records and related Supabase records. A new deletion audit entry is kept.")
         if not students:
@@ -872,6 +890,26 @@ def dashboard():
                 except Exception as exc:
                     st.error(f"❌ Delete failed: {exc}")
 
+
+
+    # ------------------------------------------------------------
+    # FINAL HISTORY CONTROL — delete historical Principal activity
+    # ------------------------------------------------------------
+    st.divider()
+    st.subheader("🧹 Delete All Principal History")
+    st.warning("This clears audit/activity history, salary-credit transaction history, and generated day-by-day Principal history files. Current Students, Tutors, Marks and Smart Cards are NOT deleted.")
+    history_confirm=st.checkbox("I understand that ALL historical activity/salary history will be permanently deleted.",key="principal_delete_all_history_confirm")
+    if st.button("🧹 DELETE ALL HISTORY",type="primary",use_container_width=True,key="principal_delete_all_history_button",disabled=not history_confirm):
+        try:
+            errs=delete_all_principal_history(sb)
+            if errs:
+                st.error("Some history could not be deleted: " + " | ".join(errs))
+            else:
+                st.success("✅ All Principal history has been deleted. Current student/tutor records remain safe.")
+            st.session_state.pop("principal_delete_all_history_confirm",None)
+            st.rerun()
+        except Exception as exc:
+            st.error(f"❌ History deletion failed: {exc}")
 
 
 if "principal_auth" not in st.session_state:
