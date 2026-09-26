@@ -330,65 +330,79 @@ def get_salary_transactions(sb):
 
 
 def approve_tutor_salary(sb, transaction):
-    """Approve one pending salary and credit it to the tutor salary account.
-
-    The tutor account balance is updated first, then the same transaction is
-    marked ``credited``. The tutor salary-account page reads this shared
-    Supabase balance, so the approved amount becomes visible immediately.
-    """
+    """Approve ONE pending tutor salary request and credit the tutor wallet safely."""
     txid = transaction.get("id")
     if txid is None:
-        raise ValueError("Salary transaction ID is missing.")
-    if str(transaction.get("status", "")).strip().lower() != "pending":
-        raise ValueError("This salary request is already processed.")
+        raise ValueError("Salary request ID is missing.")
+
+    status = str(transaction.get("status") or "").strip().lower()
+    if status != "pending":
+        raise ValueError("This salary request is not pending. It may already be credited.")
 
     email = str(transaction.get("tutor_id") or "").strip().lower()
-    amount = float(transaction.get("amount") or 0)
-    name = str(transaction.get("tutor_name") or "").strip()
-    if not email or not name or amount <= 0:
+    tutor_name = str(transaction.get("tutor_name") or "").strip()
+    amount = round(float(transaction.get("amount") or 0), 2)
+    if not email or amount <= 0:
         raise ValueError("Invalid tutor salary account or salary amount.")
 
+    # Load the tutor salary account.
     account_rows = rows(
-        sb.table("tutor_accounts").select("*").eq("email", email).limit(1).execute()
+        sb.table("tutor_accounts")
+        .select("*")
+        .eq("email", email)
+        .limit(1)
+        .execute()
     )
     if not account_rows:
         raise ValueError(f"Tutor salary account not found for {email}.")
 
     account = account_rows[0]
-    current_balance = float(account.get("balance") or 0)
-    new_balance = round(current_balance + amount, 2)
+    if account.get("active") is False:
+        raise ValueError("This tutor salary account is inactive.")
 
-    # Update the shared tutor wallet.
+    old_balance = round(float(account.get("balance") or 0), 2)
+    new_balance = round(old_balance + amount, 2)
+
+    # First credit the wallet.
     sb.table("tutor_accounts").update({"balance": new_balance}).eq("email", email).execute()
 
-    # Mark this exact salary request as approved/credited.
-    updated = rows(
+    # Then mark THIS exact pending request as credited.
+    updated_rows = rows(
         sb.table("tutor_salary_transactions")
         .update({"status": "credited"})
         .eq("id", txid)
         .eq("status", "pending")
         .execute()
     )
-    if not updated:
-        # Prevent a silent balance credit if the request was already processed.
-        sb.table("tutor_accounts").update({"balance": current_balance}).eq("email", email).execute()
-        raise ValueError("Salary request was already processed or could not be marked credited.")
 
-    sb.table("audit_logs").insert({
-        "username": PRINCIPAL_USERNAME,
-        "role": "Principal",
-        "action": "Tutor Salary Approved and Credited",
-        "university_id": "",
-        "department": str(account.get("department") or ""),
-        "semester": str(account.get("semester") or "").upper(),
-        "details": (
-            f"Tutor={name}; Email={email}; Amount=₹{amount:.2f}; "
-            f"Month={transaction.get('salary_month','')}; "
-            f"Reference={transaction.get('reference','')}; "
-            f"New Balance=₹{new_balance:.2f}"
-        )
-    }).execute()
+    # Never leave the wallet credited if the transaction could not be changed.
+    if not updated_rows:
+        sb.table("tutor_accounts").update({"balance": old_balance}).eq("email", email).execute()
+        raise ValueError("Salary request was already processed or could not be marked as credited.")
+
+    # Record the approval for Principal audit/history.
+    try:
+        sb.table("audit_logs").insert({
+            "username": PRINCIPAL_USERNAME,
+            "role": "Principal",
+            "action": "Tutor Salary Approved and Credited",
+            "university_id": "",
+            "department": str(account.get("department") or ""),
+            "semester": str(account.get("semester") or "").upper(),
+            "details": (
+                f"Tutor={tutor_name or account.get('tutor_name','')}; "
+                f"Email={email}; Amount=₹{amount:.2f}; "
+                f"Month={transaction.get('salary_month','')}; "
+                f"Reference={transaction.get('reference','')}; "
+                f"Old Balance=₹{old_balance:.2f}; New Balance=₹{new_balance:.2f}"
+            )
+        }).execute()
+    except Exception:
+        # Salary is already correctly credited; audit failure should not undo a valid payment.
+        pass
+
     return new_balance
+
 
 def delete_all_principal_history(sb):
     """Delete historical activity, mark-result history, salary transaction history and daily exports.
@@ -673,31 +687,13 @@ def dashboard():
         else:
             st.success("No pending salary approvals.")
 
-        st.subheader("💳 Tutor Salary Accounts — Current Balance")
-        if salary_accounts:
-            account_df = pd.DataFrame([{
-                "Tutor Name": a.get("tutor_name", ""),
-                "Email": a.get("email", ""),
-                "Department": a.get("department", ""),
-                "Semester": a.get("semester", ""),
-                "Account Balance (₹)": float(a.get("balance") or 0),
-                "Account Status": "Active" if a.get("active", True) else "Inactive",
-            } for a in salary_accounts])
-            st.dataframe(account_df, use_container_width=True, hide_index=True)
-        else:
-            st.info("No tutor salary accounts created yet.")
-
         st.subheader("💳 Salary Transaction History")
         if salary_transactions:
             txdf = pd.DataFrame([{
-                "Date": r.get("sent_at", ""),
-                "Tutor Name": r.get("tutor_name", ""),
-                "Email": r.get("tutor_id", ""),
-                "Amount (₹)": float(r.get("amount") or 0),
-                "Month": r.get("salary_month", ""),
-                "Status": "✅ APPROVED / CREDITED" if str(r.get("status", "")).lower() == "credited" else "⏳ PENDING",
-                "Sent By": r.get("sent_by", ""),
-                "Reference": r.get("reference", "")
+                "Date": r.get("sent_at", ""), "Tutor Name": r.get("tutor_name", ""),
+                "Email": r.get("tutor_id", ""), "Amount (₹)": float(r.get("amount") or 0),
+                "Month": r.get("salary_month", ""), "Status": r.get("status", ""),
+                "Sent By": r.get("sent_by", ""), "Reference": r.get("reference", "")
             } for r in salary_transactions])
             st.dataframe(txdf, use_container_width=True, hide_index=True)
         else:
@@ -761,7 +757,11 @@ def dashboard():
         st.caption("Folders are generated dynamically from the live Supabase records. Each department and semester gets separate Student, Tutor and Analysis sections.")
         rate_for_folders = float(rate) if "rate" in locals() else 100.0
         folders = build_folder_records(students, tutors, marks, smart, audit, completed, rate_for_folders)
-        runtime_root = write_runtime_folders(folders, completed, rate_for_folders)
+        try:
+            runtime_root = write_runtime_folders(folders, completed, rate_for_folders)
+        except Exception as folder_exc:
+            runtime_root = "Not written (dashboard data is still available)"
+            st.warning(f"⚠️ Runtime folder export skipped: {folder_exc}")
 
         if not folders:
             st.info("No department/semester records are available yet.")
@@ -873,7 +873,7 @@ def dashboard():
 
 
 def main():
-    """Start the Principal Streamlit application."""
+    """Streamlit entry point used by principal_dashboard.py."""
     if "principal_auth" not in st.session_state:
         st.session_state.principal_auth = False
     if not st.session_state.principal_auth:
