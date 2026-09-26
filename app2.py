@@ -912,11 +912,17 @@ def dashboard():
             st.error(f"❌ History deletion failed: {exc}")
 
 
-if "principal_auth" not in st.session_state:
-    st.session_state.principal_auth = False
+def main():
+    """Main entry point for the Principal Streamlit application."""
+    if "principal_auth" not in st.session_state:
+        st.session_state.principal_auth = False
 
-if not st.session_state.principal_auth:
-    login()
-else:
-    dashboard()
+    if not st.session_state.principal_auth:
+        login()
+    else:
+        dashboard()
+
+
+if __name__ == "__main__":
+    main()
 
