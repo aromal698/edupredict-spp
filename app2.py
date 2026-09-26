@@ -119,48 +119,18 @@ def extract_completed(audit):
 def extract_pending(audit):
     return [r for r in _latest_work_state(audit) if str(r.get("action","")).strip()=="Tutor Work Saved - Pending Completion"]
 
-def tutor_name_from_event(row, tutors=None):
-    """Return ONLY the registered Tutor Name for Principal-facing records.
-    Login IDs such as teacher_ce/teacher_aids are never shown.
-    """
-    username = str(row.get("username", "")).strip()
+def tutor_name_from_event(row):
     details = str(row.get("details", ""))
-
-    # First resolve the audit username against the Supabase tutors table.
-    for t in (tutors or []):
-        tid = str(t.get("tutor_id", "")).strip()
-        name = str(t.get("tutor_name", "")).strip()
-        if not name:
-            continue
-        if username and tid and username.lower() == tid.lower():
-            return name
-        if username and username.lower() == name.lower():
-            return name
-
-    # Older audit rows may have stored the tutor name in details.
     m = __import__("re").search(r"Tutor=([^;]+)", details)
     if m:
-        candidate = m.group(1).strip()
-        # Never return a teacher_* login ID from the details field.
-        if candidate and not candidate.lower().startswith("teacher_"):
-            return candidate
-        for t in (tutors or []):
-            if str(t.get("tutor_id", "")).strip().lower() == candidate.lower():
-                return str(t.get("tutor_name", "")).strip() or "Registered Tutor"
-
-    # If no real name can be resolved, use a safe display label instead of
-    # exposing the authentication username.
-    return "Registered Tutor"
-
-
-def tutor_id_from_event(row):
+        return m.group(1).strip()
     return str(row.get("username", "")).strip()
 
 def salary_breakdown(completed):
     """One salary unit per completed student upload, scoped by tutor+department+semester."""
     groups = {}
     for r in completed:
-        tutor = tutor_name_from_event(r, []) or "Registered Tutor"
+        tutor = tutor_name_from_event(r) or str(r.get("username", "")).strip() or "Unknown"
         dept = str(r.get("department", "")).strip() or "Unknown"
         sem = str(r.get("semester", "")).strip().upper() or "Unknown"
         key = (tutor, dept, sem)
@@ -190,7 +160,7 @@ def build_tutor_summary(tutors, marks, audit):
     pending = extract_pending(audit)
     groups = {}
     for r in completed + pending:
-        tutor = tutor_name_from_event(r, tutors) or str(r.get("username", "")).strip() or "Unknown"
+        tutor = tutor_name_from_event(r) or str(r.get("username", "")).strip() or "Unknown"
         dept = str(r.get("department", "")).strip() or "Unknown"
         sem = str(r.get("semester", "")).strip().upper() or "Unknown"
         key=(tutor,dept,sem)
@@ -287,7 +257,7 @@ def write_runtime_folders(folders, completed, rate):
     os.makedirs(salary_root, exist_ok=True)
     by_month_tutor = {}
     for r in completed:
-        tutor = tutor_name_from_event(r, tutors) or "Registered Tutor"
+        tutor = tutor_name_from_event(r) or "Unknown"
         month = month_label(r.get("timestamp"))
         key = (tutor, month)
         by_month_tutor.setdefault(key, []).append(r)
@@ -307,83 +277,6 @@ def write_runtime_folders(folders, completed, rate):
 def folder_dataframe(data):
     return pd.DataFrame(data) if data else pd.DataFrame()
 
-def write_daily_records(students, tutors, marks, smart, audit, completed, rate):
-    """Create separate day-by-day CSV files from the current Supabase data.
-    Each calendar day gets its own folder and files. These are regenerated from
-    Supabase on every Principal refresh, so deleted students disappear from the
-    current daily files too.
-    """
-    root = os.path.join(os.getcwd(), "principal_records", "Daily Records")
-    os.makedirs(root, exist_ok=True)
-
-    def day_of(value):
-        ts = parse_event_dt(value)
-        if pd.isna(ts):
-            return "Unknown-Date"
-        return ts.strftime("%Y-%m-%d")
-
-    def write_rows(day, filename, rows):
-        folder = os.path.join(root, safe_folder_name(day))
-        os.makedirs(folder, exist_ok=True)
-        pd.DataFrame(rows).to_csv(os.path.join(folder, filename), index=False)
-
-    groups = {}
-    for r in students:
-        groups.setdefault(day_of(r.get("registered_at")), {"students": [], "tutors": [], "marks": [], "smart": [], "activity": [], "completed": []})["students"].append(r)
-    for r in tutors:
-        groups.setdefault(day_of(r.get("registered_at")), {"students": [], "tutors": [], "marks": [], "smart": [], "activity": [], "completed": []})["tutors"].append(r)
-    for r in marks:
-        groups.setdefault(day_of(r.get("submitted_at")), {"students": [], "tutors": [], "marks": [], "smart": [], "activity": [], "completed": []})["marks"].append(r)
-    for r in smart:
-        groups.setdefault(day_of(r.get("submitted_at")), {"students": [], "tutors": [], "marks": [], "smart": [], "activity": [], "completed": []})["smart"].append(r)
-    for r in audit:
-        groups.setdefault(day_of(r.get("timestamp")), {"students": [], "tutors": [], "marks": [], "smart": [], "activity": [], "completed": []})["activity"].append(r)
-    for r in completed:
-        groups.setdefault(day_of(r.get("timestamp")), {"students": [], "tutors": [], "marks": [], "smart": [], "activity": [], "completed": []})["completed"].append(r)
-
-    for day, g in groups.items():
-        write_rows(day, "students_records.csv", g["students"])
-        write_rows(day, "tutors_records.csv", g["tutors"])
-        write_rows(day, "marks_records.csv", g["marks"])
-        write_rows(day, "smart_cards_records.csv", g["smart"])
-        write_rows(day, "tutor_activity.csv", g["activity"])
-        salary_rows = [{
-            "Completed At": r.get("timestamp", ""), "Tutor": tutor_name_from_event(r, tutors),
-            "University ID": r.get("university_id", ""), "Department": r.get("department", ""),
-            "Semester": r.get("semester", ""), "Salary (₹)": float(rate),
-        } for r in g["completed"]]
-        write_rows(day, "completed_salary_records.csv", salary_rows)
-    return root, sorted(groups.keys(), reverse=True)
-
-
-def remove_runtime_student_records(uid):
-    """Remove a student's UID from generated Principal CSV files on this runtime."""
-    uid = str(uid or "").strip()
-    if not uid:
-        return 0
-    root = os.path.join(os.getcwd(), "principal_records")
-    removed = 0
-    if not os.path.isdir(root):
-        return removed
-    for base, _, files in os.walk(root):
-        for fn in files:
-            if not fn.lower().endswith(".csv"):
-                continue
-            path = os.path.join(base, fn)
-            try:
-                df = pd.read_csv(path)
-                before = len(df)
-                for col in ["University ID", "university_id", "University_ID", "Student ID"]:
-                    if col in df.columns:
-                        df = df[df[col].astype(str).str.strip().ne(uid)]
-                if len(df) != before:
-                    df.to_csv(path, index=False)
-                    removed += before - len(df)
-            except Exception:
-                pass
-    return removed
-
-
 def delete_student_everywhere(sb, student, audit_user="Principal"):
     """Delete one student and all related records from Supabase and known local files."""
     uid = str(student.get("university_id", "")).strip()
@@ -393,12 +286,6 @@ def delete_student_everywhere(sb, student, audit_user="Principal"):
     sem = str(student.get("semester", "") or "").strip().upper()
 
     file_rows = rows(sb.table("student_files").select("file_path,file_name").eq("university_id", uid).execute())
-    # Remove the student's old Principal/Tutor activity records so the student
-    # disappears from Principal activity, folders, daily files and salary views.
-    try:
-        sb.table("audit_logs").delete().eq("university_id", uid).execute()
-    except Exception:
-        pass
     sb.table("student_marks").delete().eq("university_id", uid).execute()
     sb.table("smart_cards").delete().eq("university_id", uid).execute()
     sb.table("student_files").delete().eq("university_id", uid).execute()
@@ -414,8 +301,6 @@ def delete_student_everywhere(sb, student, audit_user="Principal"):
             except OSError:
                 pass
 
-    remove_runtime_student_records(uid)
-
     sb.table("audit_logs").insert({
         "username": audit_user,
         "role": "Principal",
@@ -427,6 +312,163 @@ def delete_student_everywhere(sb, student, audit_user="Principal"):
     }).execute()
     return uid, removed_files
 
+
+
+def get_salary_accounts(sb):
+    """Load separate tutor salary accounts. These accounts are not Tutor Dashboard logins."""
+    try:
+        return rows(sb.table("tutor_accounts").select("*").order("tutor_name").execute())
+    except Exception:
+        return []
+
+
+def get_salary_transactions(sb):
+    try:
+        return rows(sb.table("tutor_salary_transactions").select("*").order("sent_at", desc=True).execute())
+    except Exception:
+        return []
+
+
+def approve_tutor_salary(sb, transaction):
+    """Approve one pending salary and credit it to the tutor salary account.
+
+    The tutor account balance is updated first, then the same transaction is
+    marked ``credited``. The tutor salary-account page reads this shared
+    Supabase balance, so the approved amount becomes visible immediately.
+    """
+    txid = transaction.get("id")
+    if txid is None:
+        raise ValueError("Salary transaction ID is missing.")
+    if str(transaction.get("status", "")).strip().lower() != "pending":
+        raise ValueError("This salary request is already processed.")
+
+    email = str(transaction.get("tutor_id") or "").strip().lower()
+    amount = float(transaction.get("amount") or 0)
+    name = str(transaction.get("tutor_name") or "").strip()
+    if not email or not name or amount <= 0:
+        raise ValueError("Invalid tutor salary account or salary amount.")
+
+    account_rows = rows(
+        sb.table("tutor_accounts").select("*").eq("email", email).limit(1).execute()
+    )
+    if not account_rows:
+        raise ValueError(f"Tutor salary account not found for {email}.")
+
+    account = account_rows[0]
+    current_balance = float(account.get("balance") or 0)
+    new_balance = round(current_balance + amount, 2)
+
+    # Update the shared tutor wallet.
+    sb.table("tutor_accounts").update({"balance": new_balance}).eq("email", email).execute()
+
+    # Mark this exact salary request as approved/credited.
+    updated = rows(
+        sb.table("tutor_salary_transactions")
+        .update({"status": "credited"})
+        .eq("id", txid)
+        .eq("status", "pending")
+        .execute()
+    )
+    if not updated:
+        # Prevent a silent balance credit if the request was already processed.
+        sb.table("tutor_accounts").update({"balance": current_balance}).eq("email", email).execute()
+        raise ValueError("Salary request was already processed or could not be marked credited.")
+
+    sb.table("audit_logs").insert({
+        "username": PRINCIPAL_USERNAME,
+        "role": "Principal",
+        "action": "Tutor Salary Approved and Credited",
+        "university_id": "",
+        "department": str(account.get("department") or ""),
+        "semester": str(account.get("semester") or "").upper(),
+        "details": (
+            f"Tutor={name}; Email={email}; Amount=₹{amount:.2f}; "
+            f"Month={transaction.get('salary_month','')}; "
+            f"Reference={transaction.get('reference','')}; "
+            f"New Balance=₹{new_balance:.2f}"
+        )
+    }).execute()
+    return new_balance
+
+def delete_all_principal_history(sb):
+    """Delete historical activity, mark-result history, salary transaction history and daily exports.
+    Current Students, Tutors, Smart Cards and tutor salary account balances are preserved.
+    """
+    errors = []
+    for table in ("audit_logs", "student_marks", "tutor_salary_transactions"):
+        try:
+            sb.table(table).delete().gt("id", 0).execute()
+        except Exception as exc:
+            errors.append(f"{table}: {exc}")
+
+    runtime_root = os.path.join(os.getcwd(), "principal_records")
+    try:
+        if os.path.isdir(runtime_root):
+            import shutil
+            shutil.rmtree(runtime_root)
+    except Exception as exc:
+        errors.append(f"runtime principal_records: {exc}")
+    return errors
+
+
+def date_only(value):
+    ts = parse_event_dt(value)
+    if pd.isna(ts):
+        return "Unknown Date"
+    return ts.strftime("%Y-%m-%d")
+
+
+def build_datewise_records(students, tutors, marks, smart, audit, salary_transactions):
+    """Create one combined date-wise view for Student and Tutor records."""
+    records = []
+    for r in students:
+        records.append({
+            "Date": date_only(r.get("registered_at")), "Record Type": "Student",
+            "Name": r.get("student_name", ""), "University ID": r.get("university_id", ""),
+            "Department": r.get("department", ""), "Semester": r.get("semester", ""),
+            "Action": "Student Registered", "Time": r.get("registered_at", ""),
+            "Details": f"College={r.get('studied_college','')}; Registered By={r.get('registered_by','')}"
+        })
+    for r in tutors:
+        records.append({
+            "Date": date_only(r.get("registered_at")), "Record Type": "Tutor",
+            "Name": r.get("tutor_name", ""), "University ID": "",
+            "Department": r.get("department", ""), "Semester": r.get("semester", ""),
+            "Action": "Tutor Registered", "Time": r.get("registered_at", ""),
+            "Details": "Tutor account/profile registered"
+        })
+    for r in marks:
+        records.append({
+            "Date": date_only(r.get("submitted_at")), "Record Type": "Student Work",
+            "Name": r.get("tutor_name", ""), "University ID": r.get("university_id", ""),
+            "Department": r.get("department", ""), "Semester": r.get("semester", ""),
+            "Action": "Marks Submitted", "Time": r.get("submitted_at", ""),
+            "Details": "Tutor student mark/result record"
+        })
+    for r in audit:
+        role = str(r.get("role", "")).strip()
+        if role.lower() not in {"tutor", "principal", "student"}:
+            continue
+        records.append({
+            "Date": date_only(r.get("timestamp")), "Record Type": role.title() or "Activity",
+            "Name": tutor_name_from_event(r) if role.lower() == "tutor" else r.get("username", ""),
+            "University ID": r.get("university_id", ""),
+            "Department": r.get("department", ""), "Semester": r.get("semester", ""),
+            "Action": r.get("action", ""), "Time": r.get("timestamp", ""),
+            "Details": r.get("details", "")
+        })
+    for r in salary_transactions:
+        records.append({
+            "Date": date_only(r.get("sent_at")), "Record Type": "Tutor Salary",
+            "Name": r.get("tutor_name", ""), "University ID": "",
+            "Department": "", "Semester": "", "Action": f"Salary {r.get('status','')}",
+            "Time": r.get("sent_at", ""),
+            "Details": f"₹{float(r.get('amount') or 0):,.2f} • Month={r.get('salary_month','')}"
+        })
+    df = pd.DataFrame(records)
+    if not df.empty:
+        df = df.sort_values(["Date", "Time"], ascending=[False, False])
+    return df
 
 def login():
     st.title("🛡️ EduPredict SPP — Principal Portal")
@@ -443,104 +485,37 @@ def login():
             st.error("Invalid username or password.")
 
 
-def tutor_accounts_for_principal(sb):
-    try: return list(getattr(sb.table("tutor_accounts").select("*").order("tutor_name").execute(),"data",None) or [])
-    except Exception: return []
-
-def salary_transactions_for_principal(sb):
-    try: return list(getattr(sb.table("tutor_salary_transactions").select("*").order("sent_at",desc=True).execute(),"data",None) or [])
-    except Exception: return []
-
-def create_salary_request(sb, account, amount, salary_month, reference):
-    """Create a PENDING salary request. It does not change the tutor balance."""
-    email = str(account.get("email") or account.get("tutor_id") or "").strip().lower()
-    name = str(account.get("tutor_name") or "").strip()
-    amount = round(float(amount), 2)
-    if not email or not name:
-        raise ValueError("Tutor salary account is incomplete.")
-    if amount <= 0:
-        raise ValueError("Salary amount must be greater than ₹0.")
-    sb.table("tutor_salary_transactions").insert({
-        "tutor_id": email,
-        "tutor_name": name,
-        "amount": amount,
-        "salary_month": str(salary_month).strip(),
-        "sent_by": PRINCIPAL_USERNAME,
-        "reference": str(reference or "").strip(),
-        "status": "pending",
-    }).execute()
-
-def approve_tutor_salary(sb, transaction):
-    """Principal approval: atomically-ish credit the wallet and mark this request credited."""
-    txid = transaction.get("id")
-    if txid is None:
-        raise ValueError("Salary transaction ID is missing.")
-    if str(transaction.get("status", "")).strip().lower() != "pending":
-        raise ValueError("This salary request is already processed.")
-
-    email = str(transaction.get("tutor_id") or "").strip().lower()
-    amount = round(float(transaction.get("amount") or 0), 2)
-    if not email or amount <= 0:
-        raise ValueError("Invalid tutor salary account or salary amount.")
-
-    account_rows = rows(sb.table("tutor_accounts").select("*").eq("email", email).limit(1).execute())
-    if not account_rows:
-        raise ValueError(f"Tutor salary account not found for {email}.")
-    account = account_rows[0]
-    current_balance = round(float(account.get("balance") or 0), 2)
-    new_balance = round(current_balance + amount, 2)
-
-    # First mark this exact request as credited only after the wallet update succeeds.
-    sb.table("tutor_accounts").update({"balance": new_balance}).eq("email", email).execute()
-    updated = rows(sb.table("tutor_salary_transactions")
-                   .update({"status": "credited"})
-                   .eq("id", txid)
-                   .eq("status", "pending")
-                   .execute())
-    if not updated:
-        # Avoid leaving a balance increase when the request was already processed.
-        sb.table("tutor_accounts").update({"balance": current_balance}).eq("email", email).execute()
-        raise ValueError("Salary request was already processed or could not be approved.")
-
-    sb.table("audit_logs").insert({
-        "username": PRINCIPAL_USERNAME,
-        "role": "Principal",
-        "action": "Tutor Salary Approved and Credited",
-        "university_id": "",
-        "department": str(account.get("department") or ""),
-        "semester": str(account.get("semester") or "").upper(),
-        "details": f"Tutor={transaction.get('tutor_name','')}; Email={email}; Amount=₹{amount:.2f}; Month={transaction.get('salary_month','')}; Reference={transaction.get('reference','')}",
-    }).execute()
-    return new_balance
-
-
 def dashboard():
     inject_principal_css()
+    # Refresh only every 30 minutes — never every minute.
     try:
         from streamlit_autorefresh import st_autorefresh
         st_autorefresh(interval=30 * 60 * 1000, key="principal_30min_refresh")
     except Exception:
+        # If the optional package is unavailable, the manual refresh button still works.
         pass
     st.title("🛡️ Principal Academic Monitoring")
-    st.caption("LIVE shared Supabase • Tutor actions + completed work + salary + Smart Cards • " + datetime.now().strftime("%d %b %Y, %I:%M:%S %p"))
+    st.caption("Shared Supabase • Date-wise Student/Tutor records • Salary approval • Smart Cards • Last loaded: " + datetime.now().strftime("%d %b %Y, %I:%M:%S %p") + " • No minute-by-minute refresh")
 
     c1, c2 = st.columns([1, 5])
     if c1.button("🚪 Logout"):
         st.session_state.principal_auth = False
         st.rerun()
-    if c2.button("🔄 Refresh Live Data", type="primary"):
+    if c2.button("🔄 Refresh Live Data (Manual)", type="primary"):
+        st.session_state.principal_last_refresh = datetime.now()
         st.rerun()
+    st.caption("Refresh policy: automatic refresh every 30 minutes only. No minute-by-minute refresh. You can also refresh manually anytime.")
 
     try:
         sb = get_supabase()
         sb.table("students").select("university_id").limit(1).execute()
         students = get_all("students", "registered_at")
         tutors = get_all("tutors", "registered_at")
-        tutor_accounts = tutor_accounts_for_principal(sb)
-        salary_transactions = salary_transactions_for_principal(sb)
         marks = get_all("student_marks", "submitted_at")
         smart = get_all("smart_cards", "submitted_at")
         audit = get_all("audit_logs", "timestamp")
+        salary_accounts = get_salary_accounts(sb)
+        salary_transactions = get_salary_transactions(sb)
     except Exception as exc:
         st.error(f"❌ Could not connect/load Supabase data: {exc}")
         st.info("Both Streamlit apps must use the same SUPABASE_URL and SUPABASE_KEY secrets and the same six Supabase tables.")
@@ -559,16 +534,37 @@ def dashboard():
 
     st.success("🟢 LIVE: Tutor completion records are read from the same Supabase database used by the Student/Tutor app.")
 
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-        "👨‍🏫 Live Tutor Activity", "💰 Tutor Salary Analysis", "🪪 Smart Cards", "📁 Academic Folders", "📅 Daily Records", "🗑️ Delete Student"
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+        "📅 Date-wise Records", "👨‍🏫 Live Tutor Activity", "💰 Tutor Salary & Approval", "🪪 Smart Cards", "📁 Academic Folders", "🗑️ Delete Student", "🧹 Delete All History"
     ])
 
     with tab1:
+        st.subheader("📅 Date-wise Student + Tutor Records")
+        st.caption("Records are grouped by date. Student registrations, tutor registrations, marks, tutor actions and salary transactions are shown by the day they were recorded.")
+        datewise = build_datewise_records(students, tutors, marks, smart, audit, salary_transactions)
+        if datewise.empty:
+            st.info("No date-wise records available yet.")
+        else:
+            dates = datewise["Date"].dropna().astype(str).unique().tolist()
+            selected_date = st.selectbox("📆 Select recorded date", dates, key="principal_datewise_select")
+            day_df = datewise[datewise["Date"] == selected_date].copy()
+            st.dataframe(day_df, use_container_width=True, hide_index=True)
+            st.download_button("📥 Download Selected Day", day_df.to_csv(index=False).encode(), f"principal_records_{selected_date}.csv", "text/csv")
+
+            st.subheader("👨‍🎓 Students recorded on this date")
+            sday = day_df[day_df["Record Type"] == "Student"]
+            st.dataframe(sday, use_container_width=True, hide_index=True) if not sday.empty else st.info("No student registration on this date.")
+
+            st.subheader("👨‍🏫 Tutors recorded on this date")
+            tday = day_df[day_df["Record Type"] == "Tutor"]
+            st.dataframe(tday, use_container_width=True, hide_index=True) if not tday.empty else st.info("No tutor registration on this date.")
+
+    with tab2:
         st.subheader("🔴 Live Tutor Activity")
         if tutor_actions:
             activity = pd.DataFrame([{
                 "Time": r.get("timestamp", ""),
-                "Tutor Name": tutor_name_from_event(r, tutors),
+                "Tutor Name": tutor_name_from_event(r),
                 "Action": r.get("action", ""),
                 "University ID": r.get("university_id", ""),
                 "Department": r.get("department", ""),
@@ -587,123 +583,127 @@ def dashboard():
         else:
             st.dataframe(summary, use_container_width=True, hide_index=True)
 
-    with tab2:
-        st.subheader("💰 Tutor Salary Analysis")
-        st.info("Salary is based on the number of students each tutor successfully completes/registers. Every completed student = one salary unit.")
-        rate = st.number_input("Salary per completed/registered student (₹)", min_value=0.0, value=100.0, step=10.0, key="principal_salary_rate")
-
-        # Count tutor work from Completed audit records, grouped by tutor.
-        tutor_rows = []
-        for tutor in tutors:
-            tid = str(tutor.get("tutor_id", "")).strip()
-            tname = str(tutor.get("tutor_name", "") or tid or "Unknown")
-            dept = str(tutor.get("department", "") or "")
-            sem = str(tutor.get("semester", "") or "").upper()
-            own = [r for r in completed if str(r.get("username", "")).strip().lower() == tid.lower()]
-            # Also match events where the tutor name itself was stored.
-            own += [r for r in completed if tutor_name_from_event(r, tutors).strip().lower() == tname.lower() and r not in own]
-            unique_students = {str(r.get("university_id", "")).strip() for r in own if str(r.get("university_id", "")).strip()}
-            tutor_rows.append({
-                "Tutor Name": tname, "Department": dept, "Semester": sem,
-                "Students Completed": len(unique_students),
-                "Completed Work": len(own),
-                "Salary (₹)": len(unique_students) * float(rate),
-            })
-
-        salary_df = pd.DataFrame(tutor_rows)
-        if salary_df.empty:
-            st.info("No tutors registered yet.")
+    with tab3:
+        st.subheader("💰 Tutor Salary & Approval")
+        st.info("Only work explicitly marked **Completed** by the Tutor is counted. Pending work is not included in salary.")
+        rate = st.number_input("Salary per completed student work (₹)", min_value=0.0, value=100.0, step=10.0, key="principal_salary_rate")
+        summary = build_tutor_summary(tutors, marks, audit)
+        if summary.empty:
+            st.info("No tutor work available for salary calculation.")
         else:
-            salary_df = salary_df.sort_values("Tutor Name")
-            st.subheader("👨‍🏫 Tutor-wise Salary Table")
-            st.dataframe(salary_df, use_container_width=True, hide_index=True)
-            st.download_button("📥 Download Tutor Salary Table", salary_df.to_csv(index=False).encode(), "tutor_salary_table.csv", "text/csv", use_container_width=True)
+            salary = summary.copy()
+            salary["Salary (₹)"] = salary["Completed Uploads"] * float(rate)
+            salary = salary[["Tutor Name","Department","Semester","Completed Uploads","Pending Uploads","Salary (₹)"]]
+            st.dataframe(salary, use_container_width=True, hide_index=True)
+            total = float(salary["Salary (₹)"].sum())
             x,y,z = st.columns(3)
-            x.metric("👨‍🏫 Tutors", len(salary_df))
-            y.metric("👥 Students Completed", int(salary_df["Students Completed"].sum()))
-            z.metric("💰 Total Salary", f"₹{salary_df['Salary (₹)'].sum():,.2f}")
+            x.metric("✅ Completed Uploads", int(salary["Completed Uploads"].sum()))
+            y.metric("⏳ Pending Uploads", int(salary["Pending Uploads"].sum()))
+            z.metric("💰 Total Tutor Salary", f"₹{total:,.2f}")
+            st.caption("Salary rule: each completed student mark upload = 1 salary unit. The unit is counted only for the tutor's assigned department + selected semester. Pending uploads receive no salary.")
 
-        st.subheader("💳 Principal Salary Approval")
-        st.info("Salary requests start as **PENDING**. The Principal must approve a request before money is added to the tutor salary account. Approved/credited salary is then visible in the tutor's separate email salary account.")
-        if tutor_accounts:
-            account_options={f"{a.get('tutor_name','')} — {a.get('department','')} — {a.get('semester','')}":a for a in tutor_accounts}
-            label=st.selectbox("Select tutor account",list(account_options.keys()),key="principal_salary_account")
-            account=account_options[label]
-            c1,c2,c3=st.columns(3)
-            amount=c1.number_input("Salary Amount (₹)",min_value=0.0,value=1000.0,step=100.0,key="principal_credit_amount")
-            salary_month=c2.text_input("Salary Month",value=datetime.now().strftime("%Y-%m"),key="principal_salary_month")
-            reference=c3.text_input("Reference / Note",placeholder="September salary",key="principal_salary_reference")
-            st.caption(f"Tutor account: **{account.get('tutor_name','')}** • Current balance: **₹{float(account.get('balance') or 0):,.2f}**")
-            if st.button("📝 Create Pending Salary Request",type="secondary",use_container_width=True,key="create_salary_request_button"):
-                try:
-                    create_salary_request(sb,account,amount,salary_month,reference)
-                    st.success(f"🟡 Salary request of ₹{amount:,.2f} created for {account.get('tutor_name','')}. Principal approval is required.")
-                    st.rerun()
-                except Exception as exc: st.error(f"❌ Salary request failed: {exc}")
-
-            pending_txs=[x for x in salary_transactions if str(x.get("status","")).lower()=="pending"]
-            st.subheader("⏳ Pending Salary — Principal Approval Required")
-            if pending_txs:
-                for tx in pending_txs:
-                    cols=st.columns([2.0,1.1,1.1,1.5,1.3])
-                    cols[0].write(f"**{tx.get('tutor_name','')}**\n{tx.get('reference','')}")
-                    cols[1].write(f"₹{float(tx.get('amount') or 0):,.2f}")
-                    cols[2].write(str(tx.get('salary_month','')))
-                    cols[3].write("🟡 PENDING")
-                    if cols[4].button("✅ Approve",key=f"approve_salary_{tx.get('id')}",use_container_width=True):
-                        try:
-                            new_balance=approve_tutor_salary(sb,tx)
-                            st.success(f"✅ Approved ₹{float(tx.get('amount') or 0):,.2f} for {tx.get('tutor_name','')}. New account balance: ₹{new_balance:,.2f}")
-                            st.rerun()
-                        except Exception as exc: st.error(f"❌ Approval failed: {exc}")
-            else:
-                st.success("No pending salary requests.")
-
-            st.subheader("💰 Tutor Account Balances")
-            balances=pd.DataFrame([{"Tutor Name":a.get("tutor_name",""),"Department":a.get("department",""),"Semester":str(a.get("semester","")).upper(),"Account Balance (₹)":float(a.get("balance") or 0),"Account Created":a.get("created_at","")} for a in tutor_accounts])
-            st.dataframe(balances,use_container_width=True,hide_index=True)
-            if salary_transactions:
-                st.subheader("📜 Salary Transaction History")
-                txdf=pd.DataFrame([{"Date":x.get("sent_at",""),"Tutor Name":x.get("tutor_name",""),"Month":x.get("salary_month",""),"Amount (₹)":float(x.get("amount") or 0),"Reference":x.get("reference",""),"Status":"✅ APPROVED / CREDITED" if str(x.get("status","")).lower()=="credited" else "🟡 PENDING"} for x in salary_transactions])
-                st.dataframe(txdf,use_container_width=True,hide_index=True)
-        else: st.info("No email-based tutor accounts have been created yet. Create one from the 👤 circle icon on the Tutor Login page.")
-
-        st.subheader("📅 Monthly Salary — Every Tutor")
+        st.subheader("📅 Monthly Salary — Tutor / Month")
         if completed:
             monthly_rows = []
             for r in completed:
-                uid = str(r.get("university_id", "")).strip()
                 monthly_rows.append({
                     "Month": month_label(r.get("timestamp")),
-                    "Tutor Name": tutor_name_from_event(r, tutors),
+                    "Tutor Name": tutor_name_from_event(r),
                     "Department": r.get("department", ""),
                     "Semester": str(r.get("semester", "")).upper(),
-                    "Students Completed": 1 if uid else 0,
-                    "Salary (₹)": float(rate) if uid else 0.0,
+                    "Completed Uploads": 1,
+                    "Salary (₹)": float(rate),
                 })
             monthly = pd.DataFrame(monthly_rows).groupby(
                 ["Month", "Tutor Name", "Department", "Semester"], as_index=False
-            ).agg({"Students Completed":"sum", "Salary (₹)":"sum"}).sort_values(["Month", "Tutor Name"], ascending=[False, True])
+            ).agg({"Completed Uploads": "sum", "Salary (₹)": "sum"}).sort_values(
+                ["Month", "Tutor Name"], ascending=[False, True]
+            )
             st.dataframe(monthly, use_container_width=True, hide_index=True)
-            st.download_button("📥 Download Monthly Tutor Salary", monthly.to_csv(index=False).encode(), "monthly_tutor_salary.csv", "text/csv", use_container_width=True)
+            st.download_button("📥 Download Monthly Tutor Salary", monthly.to_csv(index=False).encode(), "monthly_tutor_salary.csv", "text/csv")
         else:
             st.info("No completed tutor work for monthly salary yet.")
 
-        st.subheader("✅ Tutor Completed Work + Salary Details")
+        st.subheader("✅ Completed Work Details")
         if completed:
             details = pd.DataFrame([{
                 "Completed At": r.get("timestamp", ""),
-                "Tutor": tutor_name_from_event(r, tutors),
-                "Student University ID": r.get("university_id", ""),
+                "Tutor": tutor_name_from_event(r),
+                "Student": r.get("university_id", ""),
                 "Department": r.get("department", ""),
                 "Semester": r.get("semester", ""),
-                "Salary (₹)": float(rate),
+                "Details": r.get("details", ""),
             } for r in completed])
             st.dataframe(details, use_container_width=True, hide_index=True)
         else:
             st.info("No Tutor work has been marked Completed yet.")
 
-    with tab3:
+
+        st.subheader("🏦 Tutor Salary Accounts")
+        st.caption("Salary accounts are separate from normal Tutor Login accounts. Principal approval credits money into the tutor's salary wallet.")
+        if salary_accounts:
+            account_df = pd.DataFrame([{
+                "Tutor Name": a.get("tutor_name", ""), "Email": a.get("email", ""),
+                "Department": a.get("department", ""), "Semester": a.get("semester", ""),
+                "Balance (₹)": float(a.get("balance") or 0), "Active": a.get("active", True)
+            } for a in salary_accounts])
+            st.dataframe(account_df, use_container_width=True, hide_index=True)
+        else:
+            st.info("No tutor salary accounts found. Tutors can create their separate salary account from the Tutor Login page.")
+
+        st.subheader("⏳ Pending Salary Approvals")
+        pending_salary = [r for r in salary_transactions if str(r.get("status", "")).lower() == "pending"]
+        if pending_salary:
+            pdf = pd.DataFrame([{
+                "ID": r.get("id"), "Tutor Name": r.get("tutor_name", ""), "Email": r.get("tutor_id", ""),
+                "Amount (₹)": float(r.get("amount") or 0), "Salary Month": r.get("salary_month", ""),
+                "Requested By": r.get("sent_by", ""), "Reference": r.get("reference", ""), "Requested At": r.get("sent_at", "")
+            } for r in pending_salary])
+            st.dataframe(pdf, use_container_width=True, hide_index=True)
+            labels = {f"#{r.get('id')} — {r.get('tutor_name','')} — ₹{float(r.get('amount') or 0):,.2f} — {r.get('salary_month','')}": r for r in pending_salary}
+            selected_salary_label = st.selectbox("Select one pending salary request", list(labels.keys()), key="principal_salary_approval_select")
+            selected_salary = labels[selected_salary_label]
+            if st.button("✅ APPROVE & CREDIT TO TUTOR ACCOUNT", type="primary", use_container_width=True):
+                try:
+                    new_balance = approve_tutor_salary(sb, selected_salary)
+                    st.success(f"✅ Salary credited successfully. New tutor account balance: ₹{new_balance:,.2f}")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"❌ Salary approval failed: {exc}")
+        else:
+            st.success("No pending salary approvals.")
+
+        st.subheader("💳 Tutor Salary Accounts — Current Balance")
+        if salary_accounts:
+            account_df = pd.DataFrame([{
+                "Tutor Name": a.get("tutor_name", ""),
+                "Email": a.get("email", ""),
+                "Department": a.get("department", ""),
+                "Semester": a.get("semester", ""),
+                "Account Balance (₹)": float(a.get("balance") or 0),
+                "Account Status": "Active" if a.get("active", True) else "Inactive",
+            } for a in salary_accounts])
+            st.dataframe(account_df, use_container_width=True, hide_index=True)
+        else:
+            st.info("No tutor salary accounts created yet.")
+
+        st.subheader("💳 Salary Transaction History")
+        if salary_transactions:
+            txdf = pd.DataFrame([{
+                "Date": r.get("sent_at", ""),
+                "Tutor Name": r.get("tutor_name", ""),
+                "Email": r.get("tutor_id", ""),
+                "Amount (₹)": float(r.get("amount") or 0),
+                "Month": r.get("salary_month", ""),
+                "Status": "✅ APPROVED / CREDITED" if str(r.get("status", "")).lower() == "credited" else "⏳ PENDING",
+                "Sent By": r.get("sent_by", ""),
+                "Reference": r.get("reference", "")
+            } for r in salary_transactions])
+            st.dataframe(txdf, use_container_width=True, hide_index=True)
+        else:
+            st.info("No salary transactions recorded yet.")
+
+    with tab4:
         st.subheader("🪪 Smart Card + Full Student Monitoring")
         st.caption("Principal can see the complete Smart Card details, student profile, tutor directory, and live tutor work from the shared database.")
         if smart:
@@ -756,7 +756,7 @@ def dashboard():
             st.info("No tutor profiles available yet.")
 
 
-    with tab4:
+    with tab5:
         st.subheader("📁 Department → Semester → Students / Tutors / Analysis")
         st.caption("Folders are generated dynamically from the live Supabase records. Each department and semester gets separate Student, Tutor and Analysis sections.")
         rate_for_folders = float(rate) if "rate" in locals() else 100.0
@@ -779,14 +779,7 @@ def dashboard():
                 st.dataframe(df, use_container_width=True, hide_index=True) if not df.empty else st.info("No students in this folder.")
             with f2:
                 df = folder_dataframe(g["tutors"])
-                if not df.empty:
-                    # Principal sees the tutor's real registered name, not login IDs such as teacher_ce.
-                    preferred = [c for c in ["Tutor Name", "Department", "Semester", "Credit Score"] if c in df.columns]
-                    if preferred:
-                        df = df[preferred]
-                    st.dataframe(df, use_container_width=True, hide_index=True)
-                else:
-                    st.info("No tutors in this folder.")
+                st.dataframe(df, use_container_width=True, hide_index=True) if not df.empty else st.info("No tutors in this folder.")
             with f3:
                 df = folder_dataframe(g["marks"])
                 st.dataframe(df, use_container_width=True, hide_index=True) if not df.empty else st.info("No mark records in this folder.")
@@ -802,7 +795,7 @@ def dashboard():
             salary_records = []
             for r in completed:
                 salary_records.append({
-                    "Tutor Name": tutor_name_from_event(r, tutors),
+                    "Tutor Name": tutor_name_from_event(r),
                     "Month": month_label(r.get("timestamp")),
                     "Department": r.get("department", ""),
                     "Semester": str(r.get("semester", "")).upper(),
@@ -827,47 +820,9 @@ def dashboard():
             st.caption(f"Runtime folder tree created at: `{runtime_root}`. Supabase remains the permanent database; Streamlit Cloud runtime folders can reset on redeploy/restart.")
 
 
-    with tab5:
-        st.subheader("📅 Day-by-Day Recorded Files / Tables")
-        st.caption("Every day is kept separately as YYYY-MM-DD. The tables below are regenerated from the live Supabase database, so a deleted student is removed from the displayed records.")
-        rate_for_daily = float(rate) if "rate" in locals() else 100.0
-        daily_root, available_days = write_daily_records(students, tutors, marks, smart, audit, completed, rate_for_daily)
-        if not available_days:
-            st.info("No dated records available yet.")
-        else:
-            selected_day = st.selectbox("📅 Select recording day", available_days, key="principal_daily_day")
-            day_folder = os.path.join(daily_root, safe_folder_name(selected_day))
-            st.markdown(f"### 📅 Records for {selected_day}")
-            files_for_day = [
-                ("students_records.csv", "👨‍🎓 Students"),
-                ("tutors_records.csv", "👨‍🏫 Tutors"),
-                ("marks_records.csv", "📝 Marks"),
-                ("smart_cards_records.csv", "🪪 Smart Cards"),
-                ("tutor_activity.csv", "🔴 Tutor Activity"),
-                ("completed_salary_records.csv", "💰 Completed / Salary"),
-            ]
-            for filename, title in files_for_day:
-                path = os.path.join(day_folder, filename)
-                st.markdown(f"**{title}** — `{filename}`")
-                if os.path.isfile(path):
-                    try:
-                        ddf = pd.read_csv(path)
-                    except Exception:
-                        ddf = pd.DataFrame()
-                    if ddf.empty:
-                        st.info("No records in this table for this day.")
-                    else:
-                        st.dataframe(ddf, use_container_width=True, hide_index=True)
-                        st.download_button(f"📥 Download {filename}", ddf.to_csv(index=False).encode(), filename, "text/csv", key=f"daily_download_{selected_day}_{filename}")
-                else:
-                    st.info("No records in this table for this day.")
-
-        st.caption(f"Daily files are generated under `{daily_root}` on the current Streamlit runtime. Supabase is the permanent source of truth.")
-
-
     with tab6:
         st.subheader("🗑️ Delete Student — One at a Time")
-        st.warning("⚠️ Permanent deletion: this removes the selected student's registration, marks/results, Smart Card, uploaded student files, old tutor activity, daily Principal records and related Supabase records. A new deletion audit entry is kept.")
+        st.warning("⚠️ Permanent deletion: this removes the selected student's registration, marks/results, Smart Card, uploaded student files, and related Supabase records. The deletion is also recorded in the Principal audit log.")
         if not students:
             st.info("No registered students are available to delete.")
         else:
@@ -899,9 +854,26 @@ def dashboard():
                     st.error(f"❌ Delete failed: {exc}")
 
 
+    with tab7:
+        st.subheader("🧹 Delete All Principal History")
+        st.warning("This deletes historical Student/Tutor activity, student mark/result history, salary transaction history, and generated principal daily folders. Current Student profiles, Tutor profiles, Smart Cards, and tutor salary account balances are preserved.")
+        confirm_history = st.checkbox("I understand this permanently deletes ALL historical records listed above.", key="principal_delete_all_history_confirm")
+        if st.button("🗑️ DELETE ALL STUDENT + TUTOR HISTORY", type="primary", use_container_width=True, disabled=not confirm_history):
+            try:
+                errors = delete_all_principal_history(sb)
+                if errors:
+                    st.warning("History deletion completed with some warnings: " + " | ".join(errors))
+                else:
+                    st.success("✅ All Principal Student/Tutor history was deleted. Current master profiles and salary balances remain.")
+                st.session_state.pop("principal_delete_all_history_confirm", None)
+                st.rerun()
+            except Exception as exc:
+                st.error(f"❌ History deletion failed: {exc}")
+
+
 
 def main():
-    """Run the Principal application."""
+    """Start the Principal Streamlit application."""
     if "principal_auth" not in st.session_state:
         st.session_state.principal_auth = False
     if not st.session_state.principal_auth:
@@ -912,3 +884,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
