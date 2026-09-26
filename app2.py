@@ -119,48 +119,18 @@ def extract_completed(audit):
 def extract_pending(audit):
     return [r for r in _latest_work_state(audit) if str(r.get("action","")).strip()=="Tutor Work Saved - Pending Completion"]
 
-def tutor_name_from_event(row, tutors=None):
-    """Return ONLY the registered Tutor Name for Principal-facing records.
-    Login IDs such as teacher_ce/teacher_aids are never shown.
-    """
-    username = str(row.get("username", "")).strip()
+def tutor_name_from_event(row):
     details = str(row.get("details", ""))
-
-    # First resolve the audit username against the Supabase tutors table.
-    for t in (tutors or []):
-        tid = str(t.get("tutor_id", "")).strip()
-        name = str(t.get("tutor_name", "")).strip()
-        if not name:
-            continue
-        if username and tid and username.lower() == tid.lower():
-            return name
-        if username and username.lower() == name.lower():
-            return name
-
-    # Older audit rows may have stored the tutor name in details.
     m = __import__("re").search(r"Tutor=([^;]+)", details)
     if m:
-        candidate = m.group(1).strip()
-        # Never return a teacher_* login ID from the details field.
-        if candidate and not candidate.lower().startswith("teacher_"):
-            return candidate
-        for t in (tutors or []):
-            if str(t.get("tutor_id", "")).strip().lower() == candidate.lower():
-                return str(t.get("tutor_name", "")).strip() or "Registered Tutor"
-
-    # If no real name can be resolved, use a safe display label instead of
-    # exposing the authentication username.
-    return "Registered Tutor"
-
-
-def tutor_id_from_event(row):
+        return m.group(1).strip()
     return str(row.get("username", "")).strip()
 
 def salary_breakdown(completed):
     """One salary unit per completed student upload, scoped by tutor+department+semester."""
     groups = {}
     for r in completed:
-        tutor = tutor_name_from_event(r, []) or "Registered Tutor"
+        tutor = tutor_name_from_event(r) or str(r.get("username", "")).strip() or "Unknown"
         dept = str(r.get("department", "")).strip() or "Unknown"
         sem = str(r.get("semester", "")).strip().upper() or "Unknown"
         key = (tutor, dept, sem)
@@ -190,7 +160,7 @@ def build_tutor_summary(tutors, marks, audit):
     pending = extract_pending(audit)
     groups = {}
     for r in completed + pending:
-        tutor = tutor_name_from_event(r, tutors) or str(r.get("username", "")).strip() or "Unknown"
+        tutor = tutor_name_from_event(r) or str(r.get("username", "")).strip() or "Unknown"
         dept = str(r.get("department", "")).strip() or "Unknown"
         sem = str(r.get("semester", "")).strip().upper() or "Unknown"
         key=(tutor,dept,sem)
@@ -287,7 +257,7 @@ def write_runtime_folders(folders, completed, rate):
     os.makedirs(salary_root, exist_ok=True)
     by_month_tutor = {}
     for r in completed:
-        tutor = tutor_name_from_event(r, tutors) or "Registered Tutor"
+        tutor = tutor_name_from_event(r) or "Unknown"
         month = month_label(r.get("timestamp"))
         key = (tutor, month)
         by_month_tutor.setdefault(key, []).append(r)
@@ -307,83 +277,6 @@ def write_runtime_folders(folders, completed, rate):
 def folder_dataframe(data):
     return pd.DataFrame(data) if data else pd.DataFrame()
 
-def write_daily_records(students, tutors, marks, smart, audit, completed, rate):
-    """Create separate day-by-day CSV files from the current Supabase data.
-    Each calendar day gets its own folder and files. These are regenerated from
-    Supabase on every Principal refresh, so deleted students disappear from the
-    current daily files too.
-    """
-    root = os.path.join(os.getcwd(), "principal_records", "Daily Records")
-    os.makedirs(root, exist_ok=True)
-
-    def day_of(value):
-        ts = parse_event_dt(value)
-        if pd.isna(ts):
-            return "Unknown-Date"
-        return ts.strftime("%Y-%m-%d")
-
-    def write_rows(day, filename, rows):
-        folder = os.path.join(root, safe_folder_name(day))
-        os.makedirs(folder, exist_ok=True)
-        pd.DataFrame(rows).to_csv(os.path.join(folder, filename), index=False)
-
-    groups = {}
-    for r in students:
-        groups.setdefault(day_of(r.get("registered_at")), {"students": [], "tutors": [], "marks": [], "smart": [], "activity": [], "completed": []})["students"].append(r)
-    for r in tutors:
-        groups.setdefault(day_of(r.get("registered_at")), {"students": [], "tutors": [], "marks": [], "smart": [], "activity": [], "completed": []})["tutors"].append(r)
-    for r in marks:
-        groups.setdefault(day_of(r.get("submitted_at")), {"students": [], "tutors": [], "marks": [], "smart": [], "activity": [], "completed": []})["marks"].append(r)
-    for r in smart:
-        groups.setdefault(day_of(r.get("submitted_at")), {"students": [], "tutors": [], "marks": [], "smart": [], "activity": [], "completed": []})["smart"].append(r)
-    for r in audit:
-        groups.setdefault(day_of(r.get("timestamp")), {"students": [], "tutors": [], "marks": [], "smart": [], "activity": [], "completed": []})["activity"].append(r)
-    for r in completed:
-        groups.setdefault(day_of(r.get("timestamp")), {"students": [], "tutors": [], "marks": [], "smart": [], "activity": [], "completed": []})["completed"].append(r)
-
-    for day, g in groups.items():
-        write_rows(day, "students_records.csv", g["students"])
-        write_rows(day, "tutors_records.csv", g["tutors"])
-        write_rows(day, "marks_records.csv", g["marks"])
-        write_rows(day, "smart_cards_records.csv", g["smart"])
-        write_rows(day, "tutor_activity.csv", g["activity"])
-        salary_rows = [{
-            "Completed At": r.get("timestamp", ""), "Tutor": tutor_name_from_event(r, tutors),
-            "University ID": r.get("university_id", ""), "Department": r.get("department", ""),
-            "Semester": r.get("semester", ""), "Salary (₹)": float(rate),
-        } for r in g["completed"]]
-        write_rows(day, "completed_salary_records.csv", salary_rows)
-    return root, sorted(groups.keys(), reverse=True)
-
-
-def remove_runtime_student_records(uid):
-    """Remove a student's UID from generated Principal CSV files on this runtime."""
-    uid = str(uid or "").strip()
-    if not uid:
-        return 0
-    root = os.path.join(os.getcwd(), "principal_records")
-    removed = 0
-    if not os.path.isdir(root):
-        return removed
-    for base, _, files in os.walk(root):
-        for fn in files:
-            if not fn.lower().endswith(".csv"):
-                continue
-            path = os.path.join(base, fn)
-            try:
-                df = pd.read_csv(path)
-                before = len(df)
-                for col in ["University ID", "university_id", "University_ID", "Student ID"]:
-                    if col in df.columns:
-                        df = df[df[col].astype(str).str.strip().ne(uid)]
-                if len(df) != before:
-                    df.to_csv(path, index=False)
-                    removed += before - len(df)
-            except Exception:
-                pass
-    return removed
-
-
 def delete_student_everywhere(sb, student, audit_user="Principal"):
     """Delete one student and all related records from Supabase and known local files."""
     uid = str(student.get("university_id", "")).strip()
@@ -393,12 +286,6 @@ def delete_student_everywhere(sb, student, audit_user="Principal"):
     sem = str(student.get("semester", "") or "").strip().upper()
 
     file_rows = rows(sb.table("student_files").select("file_path,file_name").eq("university_id", uid).execute())
-    # Remove the student's old Principal/Tutor activity records so the student
-    # disappears from Principal activity, folders, daily files and salary views.
-    try:
-        sb.table("audit_logs").delete().eq("university_id", uid).execute()
-    except Exception:
-        pass
     sb.table("student_marks").delete().eq("university_id", uid).execute()
     sb.table("smart_cards").delete().eq("university_id", uid).execute()
     sb.table("student_files").delete().eq("university_id", uid).execute()
@@ -413,8 +300,6 @@ def delete_student_everywhere(sb, student, audit_user="Principal"):
                 removed_files += 1
             except OSError:
                 pass
-
-    remove_runtime_student_records(uid)
 
     sb.table("audit_logs").insert({
         "username": audit_user,
@@ -443,438 +328,272 @@ def login():
             st.error("Invalid username or password.")
 
 
-def tutor_accounts_for_principal(sb):
-    try: return list(getattr(sb.table("tutor_accounts").select("*").order("tutor_name").execute(),"data",None) or [])
-    except Exception: return []
-
-def salary_transactions_for_principal(sb):
-    try: return list(getattr(sb.table("tutor_salary_transactions").select("*").order("sent_at",desc=True).execute(),"data",None) or [])
-    except Exception: return []
-
-def credit_tutor_salary(sb,account,amount,salary_month,reference):
-    email=str(account.get("email") or account.get("tutor_id") or "").strip().lower(); name=str(account.get("tutor_name") or "").strip(); amount=float(amount)
-    if not email or not name: raise ValueError("Tutor account is incomplete.")
-    if amount<=0: raise ValueError("Salary amount must be greater than ₹0.")
-    new_balance=float(account.get("balance") or 0)+amount
-    sb.table("tutor_accounts").update({"balance":new_balance}).eq("email",email).execute()
-    sb.table("tutor_salary_transactions").insert({"tutor_id":email,"tutor_name":name,"amount":amount,"salary_month":str(salary_month),"sent_by":PRINCIPAL_USERNAME,"reference":str(reference or "").strip(),"status":"credited"}).execute()
-    sb.table("audit_logs").insert({"username":PRINCIPAL_USERNAME,"role":"Principal","action":"Tutor Salary Credited","university_id":"","department":str(account.get("department") or ""),"semester":str(account.get("semester") or "").upper(),"details":f"Tutor={name}; Email={email}; Amount=₹{amount:.2f}; Month={salary_month}; Reference={reference}"}).execute()
-    return new_balance
-
-
 def dashboard():
     inject_principal_css()
     try:
         from streamlit_autorefresh import st_autorefresh
-        st_autorefresh(interval=15000, key="principal_live_refresh")
+        st_autorefresh(interval=15000, key="principal_student_refresh")
     except Exception:
         pass
-    st.title("🛡️ Principal Academic Monitoring")
-    st.caption("LIVE shared Supabase • Tutor actions + completed work + salary + Smart Cards • " + datetime.now().strftime("%d %b %Y, %I:%M:%S %p"))
 
-    c1, c2 = st.columns([1, 5])
-    if c1.button("🚪 Logout"):
+    st.title("🛡️ EduPredict SPP — Principal")
+    st.caption("Student monitoring dashboard • live student records, marks, Smart Cards and activity")
+
+    top1, top2 = st.columns([1, 5])
+    if top1.button("🚪 Logout", use_container_width=True):
         st.session_state.principal_auth = False
         st.rerun()
-    if c2.button("🔄 Refresh Live Data", type="primary"):
+    if top2.button("🔄 Refresh", type="primary", use_container_width=True):
         st.rerun()
 
     try:
         sb = get_supabase()
-        sb.table("students").select("university_id").limit(1).execute()
         students = get_all("students", "registered_at")
-        tutors = get_all("tutors", "registered_at")
-        tutor_accounts = tutor_accounts_for_principal(sb)
-        salary_transactions = salary_transactions_for_principal(sb)
         marks = get_all("student_marks", "submitted_at")
         smart = get_all("smart_cards", "submitted_at")
+        files = get_all("student_files", "uploaded_at")
         audit = get_all("audit_logs", "timestamp")
     except Exception as exc:
-        st.error(f"❌ Could not connect/load Supabase data: {exc}")
-        st.info("Both Streamlit apps must use the same SUPABASE_URL and SUPABASE_KEY secrets and the same six Supabase tables.")
+        st.error(f"❌ Could not connect to Supabase: {exc}")
+        st.info("Check SUPABASE_URL and SUPABASE_KEY in Streamlit Cloud and make sure the required tables exist.")
         return
 
-    completed = extract_completed(audit)
-    pending = extract_pending(audit)
-    tutor_actions = [r for r in audit if str(r.get("role", "")).strip().lower() == "tutor"]
+    student_ids = {str(x.get("university_id", "")).strip() for x in students}
+    student_activity = [
+        r for r in audit
+        if str(r.get("university_id", "")).strip() in student_ids
+        or str(r.get("role", "")).strip().lower() == "student"
+        or "student" in str(r.get("action", "")).strip().lower()
+    ]
 
-    a,b,c,d,e = st.columns(5)
-    a.metric("👨‍🎓 Students", len(students))
-    b.metric("👨‍🏫 Tutors", len(tutors))
-    c.metric("📝 Mark Records", len(marks))
-    d.metric("✅ Completed Tutor Work", len(completed))
-    e.metric("🪪 Smart Cards", len(smart))
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("👨‍🎓 Students", len(students))
+    c2.metric("📝 Mark Records", len(marks))
+    c3.metric("🪪 Smart Cards", len(smart))
+    c4.metric("📎 Student Files", len(files))
 
-    st.success("🟢 LIVE: Tutor completion records are read from the same Supabase database used by the Student/Tutor app.")
+    st.success("🟢 LIVE STUDENT MONITORING — data is read directly from the shared Supabase database.")
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
-        "👁️ Monitoring", "💰 Salary", "📱 Normal App", "🪪 Smart Cards", "📁 Academic Folders", "📅 Daily Records", "🗑️ Delete Student"
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+        "🏠 Student Overview",
+        "👨‍🎓 Student Records",
+        "📝 Marks & Results",
+        "🪪 Smart Cards",
+        "📅 Student Activity",
+        "🗑️ Delete Student"
     ])
 
     with tab1:
-        st.subheader("🔴 Live Tutor Activity")
-        if tutor_actions:
-            activity = pd.DataFrame([{
+        st.subheader("🏠 Student Monitoring Overview")
+        if not students:
+            st.info("No students are registered yet.")
+        else:
+            df = pd.DataFrame([{
+                "University ID": r.get("university_id", ""),
+                "Student Name": r.get("student_name", ""),
+                "Department": r.get("department", ""),
+                "Semester": str(r.get("semester", "")).upper(),
+                "Studied College": r.get("studied_college", "") or "",
+                "Registered By": r.get("registered_by", "") or "",
+                "Registered At": r.get("registered_at", "") or "",
+            } for r in students])
+            st.dataframe(df, use_container_width=True, hide_index=True)
+
+            st.subheader("📊 Department-wise Student Count")
+            dept = df.groupby(["Department", "Semester"], dropna=False).size().reset_index(name="Students")
+            st.dataframe(dept, use_container_width=True, hide_index=True)
+
+        st.subheader("📌 Recent Student Activity")
+        recent = []
+        for r in student_activity[:20]:
+            recent.append({
                 "Time": r.get("timestamp", ""),
-                "Tutor Name": tutor_name_from_event(r, tutors),
                 "Action": r.get("action", ""),
                 "University ID": r.get("university_id", ""),
                 "Department": r.get("department", ""),
-                "Semester": r.get("semester", ""),
+                "Semester": str(r.get("semester", "")).upper(),
                 "Details": r.get("details", ""),
-            } for r in tutor_actions])
-            st.dataframe(activity, use_container_width=True, hide_index=True)
-            st.download_button("📥 Download Tutor Activity CSV", activity.to_csv(index=False).encode(), "tutor_activity.csv", "text/csv")
+            })
+        if recent:
+            st.dataframe(pd.DataFrame(recent), use_container_width=True, hide_index=True)
         else:
-            st.info("No Tutor activity recorded yet.")
-
-        st.subheader("📊 Tutor Work Summary")
-        summary = build_tutor_summary(tutors, marks, audit)
-        if summary.empty:
-            st.info("No tutor work available yet.")
-        else:
-            st.dataframe(summary, use_container_width=True, hide_index=True)
+            st.info("No student activity has been recorded yet.")
 
     with tab2:
-        st.subheader("💰 Tutor Salary Analysis")
-        st.info("Salary is based on the number of students each tutor successfully completes/registers. Every completed student = one salary unit.")
-        rate = st.number_input("Salary per completed/registered student (₹)", min_value=0.0, value=100.0, step=10.0, key="principal_salary_rate")
-
-        # Count tutor work from Completed audit records, grouped by tutor.
-        tutor_rows = []
-        for tutor in tutors:
-            tid = str(tutor.get("tutor_id", "")).strip()
-            tname = str(tutor.get("tutor_name", "") or tid or "Unknown")
-            dept = str(tutor.get("department", "") or "")
-            sem = str(tutor.get("semester", "") or "").upper()
-            own = [r for r in completed if str(r.get("username", "")).strip().lower() == tid.lower()]
-            # Also match events where the tutor name itself was stored.
-            own += [r for r in completed if tutor_name_from_event(r, tutors).strip().lower() == tname.lower() and r not in own]
-            unique_students = {str(r.get("university_id", "")).strip() for r in own if str(r.get("university_id", "")).strip()}
-            tutor_rows.append({
-                "Tutor Name": tname, "Department": dept, "Semester": sem,
-                "Students Completed": len(unique_students),
-                "Completed Work": len(own),
-                "Salary (₹)": len(unique_students) * float(rate),
-            })
-
-        salary_df = pd.DataFrame(tutor_rows)
-        if salary_df.empty:
-            st.info("No tutors registered yet.")
-        else:
-            salary_df = salary_df.sort_values("Tutor Name")
-            st.subheader("👨‍🏫 Tutor-wise Salary Table")
-            st.dataframe(salary_df, use_container_width=True, hide_index=True)
-            st.download_button("📥 Download Tutor Salary Table", salary_df.to_csv(index=False).encode(), "tutor_salary_table.csv", "text/csv", use_container_width=True)
-            x,y,z = st.columns(3)
-            x.metric("👨‍🏫 Tutors", len(salary_df))
-            y.metric("👥 Students Completed", int(salary_df["Students Completed"].sum()))
-            z.metric("💰 Total Salary", f"₹{salary_df['Salary (₹)'].sum():,.2f}")
-
-        st.subheader("💳 Send Salary to Tutor Account")
-        if tutor_accounts:
-            account_options={f"{a.get('tutor_name','')} — {a.get('department','')} — {a.get('semester','')}":a for a in tutor_accounts}
-            label=st.selectbox("Select tutor account",list(account_options.keys()),key="principal_salary_account")
-            account=account_options[label]
-            c1,c2,c3=st.columns(3)
-            amount=c1.number_input("Salary Amount (₹)",min_value=0.0,value=1000.0,step=100.0,key="principal_credit_amount")
-            salary_month=c2.text_input("Salary Month",value=datetime.now().strftime("%Y-%m"),key="principal_salary_month")
-            reference=c3.text_input("Reference / Note",placeholder="September salary",key="principal_salary_reference")
-            st.caption(f"Tutor account: **{account.get('tutor_name','')}**  •  Current balance: **₹{float(account.get('balance') or 0):,.2f}**")
-            if st.button("💸 Credit Salary to This Tutor Account",type="primary",use_container_width=True,key="credit_salary_button"):
-                try:
-                    new_balance=credit_tutor_salary(sb,account,amount,salary_month,reference)
-                    st.success(f"✅ ₹{amount:,.2f} credited to {account.get('tutor_name','')} salary account. New balance: ₹{new_balance:,.2f}")
-                    st.rerun()
-                except Exception as exc: st.error(f"❌ Salary credit failed: {exc}")
-            st.subheader("💰 Tutor Account Balances")
-            balances=pd.DataFrame([{"Tutor Name":a.get("tutor_name",""),"Department":a.get("department",""),"Semester":str(a.get("semester","")).upper(),"Account Balance (₹)":float(a.get("balance") or 0),"Account Created":a.get("created_at","")} for a in tutor_accounts])
-            st.dataframe(balances,use_container_width=True,hide_index=True)
-            if salary_transactions:
-                st.subheader("📜 Salary Credit History")
-                txdf=pd.DataFrame([{"Date":x.get("sent_at",""),"Tutor Name":x.get("tutor_name",""),"Month":x.get("salary_month",""),"Amount (₹)":float(x.get("amount") or 0),"Reference":x.get("reference",""),"Status":x.get("status","")} for x in salary_transactions])
-                st.dataframe(txdf,use_container_width=True,hide_index=True)
-        else: st.info("No email-based tutor accounts have been created yet. Create one from the 👤 circle icon on the Tutor Login page.")
-
-        st.subheader("📅 Monthly Salary — Every Tutor")
-        if completed:
-            monthly_rows = []
-            for r in completed:
-                uid = str(r.get("university_id", "")).strip()
-                monthly_rows.append({
-                    "Month": month_label(r.get("timestamp")),
-                    "Tutor Name": tutor_name_from_event(r, tutors),
-                    "Department": r.get("department", ""),
-                    "Semester": str(r.get("semester", "")).upper(),
-                    "Students Completed": 1 if uid else 0,
-                    "Salary (₹)": float(rate) if uid else 0.0,
-                })
-            monthly = pd.DataFrame(monthly_rows).groupby(
-                ["Month", "Tutor Name", "Department", "Semester"], as_index=False
-            ).agg({"Students Completed":"sum", "Salary (₹)":"sum"}).sort_values(["Month", "Tutor Name"], ascending=[False, True])
-            st.dataframe(monthly, use_container_width=True, hide_index=True)
-            st.download_button("📥 Download Monthly Tutor Salary", monthly.to_csv(index=False).encode(), "monthly_tutor_salary.csv", "text/csv", use_container_width=True)
-        else:
-            st.info("No completed tutor work for monthly salary yet.")
-
-        st.subheader("✅ Tutor Completed Work + Salary Details")
-        if completed:
-            details = pd.DataFrame([{
-                "Completed At": r.get("timestamp", ""),
-                "Tutor": tutor_name_from_event(r, tutors),
-                "Student University ID": r.get("university_id", ""),
+        st.subheader("👨‍🎓 Student Records")
+        if students:
+            departments = ["All"] + sorted({str(r.get("department", "")).strip() for r in students if str(r.get("department", "")).strip()})
+            semesters = ["All"] + sorted({str(r.get("semester", "")).strip().upper() for r in students if str(r.get("semester", "")).strip()})
+            f1, f2 = st.columns(2)
+            selected_dept = f1.selectbox("Department", departments, key="principal_student_dept")
+            selected_sem = f2.selectbox("Semester", semesters, key="principal_student_sem")
+            filtered = students
+            if selected_dept != "All":
+                filtered = [r for r in filtered if str(r.get("department", "")).strip() == selected_dept]
+            if selected_sem != "All":
+                filtered = [r for r in filtered if str(r.get("semester", "")).strip().upper() == selected_sem]
+            search = st.text_input("🔎 Search University ID or student name", key="principal_student_search").strip().lower()
+            if search:
+                filtered = [r for r in filtered if search in str(r.get("university_id", "")).lower() or search in str(r.get("student_name", "")).lower()]
+            rdf = pd.DataFrame([{
+                "University ID": r.get("university_id", ""),
+                "Student Name": r.get("student_name", ""),
                 "Department": r.get("department", ""),
-                "Semester": r.get("semester", ""),
-                "Salary (₹)": float(rate),
-            } for r in completed])
-            st.dataframe(details, use_container_width=True, hide_index=True)
+                "Semester": str(r.get("semester", "")).upper(),
+                "Studied College": r.get("studied_college", "") or "",
+                "Registered By": r.get("registered_by", "") or "",
+                "Registered At": r.get("registered_at", "") or "",
+                "Active": r.get("active", True),
+            } for r in filtered])
+            if rdf.empty:
+                st.info("No matching students.")
+            else:
+                st.dataframe(rdf, use_container_width=True, hide_index=True)
+                st.download_button("📥 Download Student Records", rdf.to_csv(index=False).encode(), "student_records.csv", "text/csv")
         else:
-            st.info("No Tutor work has been marked Completed yet.")
+            st.info("No student records available.")
 
     with tab3:
-        st.subheader("📱 Normal App — Principal View")
-        st.caption("This is the simple day-to-day app view: Students, Tutors, Marks/Results and search. Monitoring stays in the first tab.")
-
-        n1, n2, n3, n4 = st.tabs(["👨‍🎓 Students", "👨‍🏫 Tutors", "📝 Marks & Results", "🔎 Student Search"])
-
-        with n1:
-            st.subheader("👨‍🎓 Student Registration Records")
-            if students:
-                df = pd.DataFrame([{
+        st.subheader("📝 Student Marks & Results")
+        if not marks:
+            st.info("No marks have been submitted yet.")
+        else:
+            mark_rows = []
+            for r in marks:
+                subjects = parse_subjects(r.get("subjects"))
+                total = 0.0
+                passed = 0
+                subject_count = len(subjects)
+                for sub in subjects:
+                    try:
+                        score = float(sub.get("score", sub.get("marks", sub.get("mark", 0))) or 0)
+                    except Exception:
+                        score = 0.0
+                    total += score
+                    if score >= 40:
+                        passed += 1
+                avg = round(total / subject_count, 2) if subject_count else 0.0
+                mark_rows.append({
+                    "Submitted At": r.get("submitted_at", ""),
                     "University ID": r.get("university_id", ""),
-                    "Student Name": r.get("student_name", ""),
-                    "Department": r.get("department", ""),
-                    "Semester": r.get("semester", ""),
-                    "Studied College": r.get("studied_college", ""),
-                    "Registered By": r.get("registered_by", ""),
-                    "Registered At": r.get("registered_at", "")
-                } for r in students])
-                st.dataframe(df, use_container_width=True, hide_index=True)
-                st.download_button("📥 Download Student Records", df.to_csv(index=False).encode(), "student_records.csv", "text/csv", use_container_width=True)
-            else:
-                st.info("No students registered yet.")
-
-        with n2:
-            st.subheader("👨‍🏫 Tutor Records")
-            if tutors:
-                df = pd.DataFrame([{
-                    "Tutor Name": r.get("tutor_name", ""),
-                    "Department": r.get("department", ""),
-                    "Semester": r.get("semester", "") or "All",
-                    "Credit Score": r.get("credit_score", 0),
-                    "Active": r.get("active", True),
-                    "Registered At": r.get("registered_at", "")
-                } for r in tutors])
-                st.dataframe(df, use_container_width=True, hide_index=True)
-                st.download_button("📥 Download Tutor Records", df.to_csv(index=False).encode(), "tutor_records.csv", "text/csv", use_container_width=True)
-            else:
-                st.info("No tutors registered yet.")
-
-        with n3:
-            st.subheader("📝 Student Marks / Results")
-            if marks:
-                rows = []
-                for r in marks:
-                    rows.append({
-                        "Submitted At": r.get("submitted_at", ""),
-                        "University ID": r.get("university_id", ""),
-                        "Department": r.get("department", ""),
-                        "Semester": r.get("semester", ""),
-                        "Tutor": r.get("tutor_name", ""),
-                        "Subjects / Marks": str(r.get("subjects", ""))
-                    })
-                df = pd.DataFrame(rows)
-                st.dataframe(df, use_container_width=True, hide_index=True)
-                st.download_button("📥 Download Marks Records", df.to_csv(index=False).encode(), "marks_records.csv", "text/csv", use_container_width=True)
-            else:
-                st.info("No marks have been entered yet.")
-
-        with n4:
-            st.subheader("🔎 Search Student Profile")
-            if students:
-                options = {f"{r.get('university_id','')} — {r.get('student_name','')}": r for r in students}
-                selected = st.selectbox("Select Student", list(options.keys()), key="principal_normal_student_search")
-                student = options[selected]
-                c1, c2 = st.columns(2)
-                c1.metric("University ID", str(student.get("university_id", "")))
-                c2.metric("Department / Semester", f"{student.get('department','')} / {student.get('semester','')}")
-                st.write(f"**Name:** {student.get('student_name','')}")
-                st.write(f"**Studied College:** {student.get('studied_college','') or '—'}")
-                st.write(f"**Registered By:** {student.get('registered_by','') or '—'}")
-                st.write(f"**Registered At:** {student.get('registered_at','') or '—'}")
-
-                student_marks = [m for m in marks if str(m.get('university_id','')).strip() == str(student.get('university_id','')).strip()]
-                if student_marks:
-                    st.subheader("📊 This Student's Mark Records")
-                    st.dataframe(pd.DataFrame(student_marks), use_container_width=True, hide_index=True)
-            else:
-                st.info("No students available for search.")
-
-    with tab4:
-        st.subheader("🪪 Smart Card + Full Student Monitoring")
-        st.caption("Principal can see the complete Smart Card details, student profile, tutor directory, and live tutor work from the shared database.")
-        if smart:
-            latest_card = smart[0]
-            st.markdown(f"""<div class='smart-preview' style='background:linear-gradient(135deg,#062a6b,#0b63ce,#12a4d8,#083b8f);font-size:1.05rem;line-height:1.7;position:relative;overflow:hidden'>
-            <div style='font-size:.92rem;letter-spacing:.16em;color:#e0f2fe;font-weight:800'>EDUPREDICT SPP • STUDENT IDENTITY CARD</div>
-            <div style='font-size:2.25rem;font-weight:900;color:white;margin-top:8px'>{latest_card.get('name','')}</div>
-            <div style='font-family:monospace;font-size:1.35rem;color:white;font-weight:800'>{latest_card.get('registration_id','')}</div>
-            <div style='display:grid;grid-template-columns:1fr 1fr;gap:8px 20px;margin-top:18px'>
-            <div><b>DOB</b><br>{latest_card.get('dob','')}</div><div><b>Blood Group</b><br>{latest_card.get('blood_group','')}</div>
-            <div><b>University ID</b><br>{latest_card.get('university_id','')}</div><div><b>PIN Code</b><br>{latest_card.get('pin_code','')}</div>
-            <div><b>Department</b><br>{latest_card.get('department','')}</div><div><b>Semester</b><br>{latest_card.get('semester','')}</div>
-            <div><b>CGPA</b><br>{latest_card.get('cgpa','') or '—'}</div><div><b>University</b><br>{latest_card.get('university_name','')}</div>
-            <div style='grid-column:1/-1'><b>Studied College</b><br>{latest_card.get('studied_college','')}</div>
-            <div style='grid-column:1/-1'><b>Address</b><br>{latest_card.get('address','')}</div>
-            </div></div>""", unsafe_allow_html=True)
-            sdf = pd.DataFrame([{
-                "Registration ID": r.get("registration_id", ""), "Name": r.get("name", ""), "University ID": r.get("university_id", ""),
-                "DOB": r.get("dob", ""), "Blood Group": r.get("blood_group", ""), "Address": r.get("address", ""),
-                "PIN Code": r.get("pin_code", ""), "Studied College": r.get("studied_college", ""), "Department": r.get("department", ""),
-                "Semester": r.get("semester", ""), "CGPA": r.get("cgpa", ""), "University": r.get("university_name", ""), "Submitted": r.get("submitted_at", ""),
-            } for r in smart])
-            st.dataframe(sdf, use_container_width=True, hide_index=True)
-            st.download_button("📥 Download All Smart Card Records", sdf.to_csv(index=False).encode(), "all_smart_cards.csv", "text/csv")
-        else:
-            st.info("No Smart Cards registered yet.")
-
-        st.subheader("👨‍🎓 Complete Student Profiles")
-        if students:
-            student_df=pd.DataFrame([{
-                "University ID":r.get("university_id",""), "Student Name":r.get("student_name",""),
-                "Department":r.get("department",""), "Semester":r.get("semester",""),
-                "Studied College":r.get("studied_college","") or "", "Registered By":r.get("registered_by",""),
-                "Registered At":r.get("registered_at","")
-            } for r in students])
-            st.dataframe(student_df,use_container_width=True,hide_index=True)
-        else:
-            st.info("No student profiles available.")
-
-        st.subheader("👨‍🏫 Tutor Directory")
-        if tutors:
-            tutor_df=pd.DataFrame([{
-                "Tutor Username":r.get("tutor_id",""), "Tutor Name":r.get("tutor_name",""),
-                "Department":r.get("department",""), "Semester":r.get("semester","") or "All",
-                "Active":r.get("active",True),
-                "Registered At":r.get("registered_at","")
-            } for r in tutors])
-            st.dataframe(tutor_df,use_container_width=True,hide_index=True)
-        else:
-            st.info("No tutor profiles available yet.")
-
-
-    with tab5:
-        st.subheader("📁 Department → Semester → Students / Tutors / Analysis")
-        st.caption("Folders are generated dynamically from the live Supabase records. Each department and semester gets separate Student, Tutor and Analysis sections.")
-        rate_for_folders = float(rate) if "rate" in locals() else 100.0
-        folders = build_folder_records(students, tutors, marks, smart, audit, completed, rate_for_folders)
-        runtime_root = write_runtime_folders(folders, completed, rate_for_folders)
-
-        if not folders:
-            st.info("No department/semester records are available yet.")
-        else:
-            dept_names = sorted({d for d, _ in folders})
-            selected_dept = st.selectbox("📂 Department Folder", dept_names, key="principal_folder_dept")
-            sem_names = sorted({s for d, s in folders if d == selected_dept})
-            selected_sem = st.selectbox("📁 Semester Folder", sem_names, key="principal_folder_sem")
-            g = folders[(selected_dept, selected_sem)]
-
-            st.markdown(f"### 📂 {selected_dept} / 📁 Semester {selected_sem}")
-            f1, f2, f3, f4, f5 = st.tabs(["👨‍🎓 Students", "👨‍🏫 Tutors", "📝 Marks", "📊 Analysis", "🪪 Smart Cards"])
-            with f1:
-                df = folder_dataframe(g["students"])
-                st.dataframe(df, use_container_width=True, hide_index=True) if not df.empty else st.info("No students in this folder.")
-            with f2:
-                df = folder_dataframe(g["tutors"])
-                if not df.empty:
-                    # Principal sees the tutor's real registered name, not login IDs such as teacher_ce.
-                    preferred = [c for c in ["Tutor Name", "Department", "Semester", "Credit Score"] if c in df.columns]
-                    if preferred:
-                        df = df[preferred]
-                    st.dataframe(df, use_container_width=True, hide_index=True)
-                else:
-                    st.info("No tutors in this folder.")
-            with f3:
-                df = folder_dataframe(g["marks"])
-                st.dataframe(df, use_container_width=True, hide_index=True) if not df.empty else st.info("No mark records in this folder.")
-            with f4:
-                st.dataframe(pd.DataFrame([g["analysis"]]), use_container_width=True, hide_index=True)
-                st.caption("Analysis is scoped to this department + semester.")
-            with f5:
-                df = folder_dataframe(g["smart"])
-                st.dataframe(df, use_container_width=True, hide_index=True) if not df.empty else st.info("No Smart Cards in this folder.")
-
-            st.divider()
-            st.subheader("💰 Tutor Salary Folders")
-            salary_records = []
-            for r in completed:
-                salary_records.append({
-                    "Tutor Name": tutor_name_from_event(r, tutors),
-                    "Month": month_label(r.get("timestamp")),
                     "Department": r.get("department", ""),
                     "Semester": str(r.get("semester", "")).upper(),
-                    "Completed Uploads": 1,
-                    "Salary (₹)": rate_for_folders,
+                    "Tutor": r.get("tutor_name", "") or "",
+                    "Subjects": subject_count,
+                    "Passed": passed,
+                    "Failed": max(subject_count - passed, 0),
+                    "Average %": avg,
                 })
-            if salary_records:
-                sdf = pd.DataFrame(salary_records).groupby(
-                    ["Tutor Name", "Month", "Department", "Semester"], as_index=False
-                ).agg({"Completed Uploads":"sum", "Salary (₹)":"sum"}).sort_values(
-                    ["Tutor Name", "Month"], ascending=[True, False]
-                )
-                tutor_names = sorted(sdf["Tutor Name"].unique().tolist())
-                selected_tutor = st.selectbox("👨‍🏫 Tutor Salary Folder", tutor_names, key="salary_folder_tutor")
-                tutor_months = sdf[sdf["Tutor Name"] == selected_tutor]
-                st.markdown(f"**📂 Tutor Salary / {selected_tutor}**")
-                st.dataframe(tutor_months, use_container_width=True, hide_index=True)
-                st.download_button("📥 Download Tutor Monthly Salary Folder Data", tutor_months.to_csv(index=False).encode(), f"{safe_folder_name(selected_tutor)}_monthly_salary.csv", "text/csv")
-            else:
-                st.info("No completed tutor salary records yet.")
+            mdf = pd.DataFrame(mark_rows)
+            st.dataframe(mdf, use_container_width=True, hide_index=True)
+            st.download_button("📥 Download Marks Monitoring", mdf.to_csv(index=False).encode(), "student_marks_monitoring.csv", "text/csv")
 
-            st.caption(f"Runtime folder tree created at: `{runtime_root}`. Supabase remains the permanent database; Streamlit Cloud runtime folders can reset on redeploy/restart.")
+            st.subheader("🔍 View One Student's Submitted Subjects")
+            options = sorted({str(r.get("university_id", "")).strip() for r in marks if str(r.get("university_id", "")).strip()})
+            if options:
+                selected_uid = st.selectbox("University ID", options, key="principal_marks_student")
+                selected_marks = [r for r in marks if str(r.get("university_id", "")).strip() == selected_uid]
+                subject_rows = []
+                for r in selected_marks:
+                    for sub in parse_subjects(r.get("subjects")):
+                        try:
+                            score = float(sub.get("score", sub.get("marks", sub.get("mark", 0))) or 0)
+                        except Exception:
+                            score = 0.0
+                        subject_rows.append({
+                            "Subject": sub.get("subject", sub.get("name", "")),
+                            "Score %": score,
+                            "Result": "PASS" if score >= 40 else "FAIL",
+                            "Credits": sub.get("credit", sub.get("credits", "")),
+                            "Submitted At": r.get("submitted_at", ""),
+                            "Tutor": r.get("tutor_name", "") or "",
+                        })
+                if subject_rows:
+                    st.dataframe(pd.DataFrame(subject_rows), use_container_width=True, hide_index=True)
 
+    with tab4:
+        st.subheader("🪪 Smart Cards — Student Monitoring")
+        if not smart:
+            st.info("No Smart Cards registered yet.")
+        else:
+            sdf = pd.DataFrame([{
+                "Registration ID": r.get("registration_id", ""),
+                "Name": r.get("name", ""),
+                "University ID": r.get("university_id", ""),
+                "DOB": r.get("dob", ""),
+                "Blood Group": r.get("blood_group", ""),
+                "Address": r.get("address", ""),
+                "PIN Code": r.get("pin_code", ""),
+                "Studied College": r.get("studied_college", ""),
+                "Department": r.get("department", ""),
+                "Semester": str(r.get("semester", "")).upper(),
+                "CGPA": r.get("cgpa", ""),
+                "University": r.get("university_name", ""),
+                "Submitted": r.get("submitted_at", ""),
+            } for r in smart])
+            st.dataframe(sdf, use_container_width=True, hide_index=True)
+            st.download_button("📥 Download Smart Card Records", sdf.to_csv(index=False).encode(), "smart_card_records.csv", "text/csv")
+
+            st.subheader("🪪 Selected Student Card")
+            card_ids = [str(r.get("registration_id", "")) for r in smart]
+            selected_card_id = st.selectbox("Registration ID", card_ids, key="principal_card_select")
+            card = next((r for r in smart if str(r.get("registration_id", "")) == selected_card_id), smart[0])
+            st.markdown(f"""
+            <div class='smart-preview'>
+              <div style='letter-spacing:.12em;color:#bae6fd;font-weight:800'>EDUPREDICT SPP • STUDENT ID CARD</div>
+              <div style='font-size:2rem;color:white;font-weight:900;margin-top:8px'>{card.get('name','')}</div>
+              <div style='font-family:monospace;font-size:1.2rem;color:#e0f2fe'>{card.get('registration_id','')}</div>
+              <hr style='border-color:rgba(255,255,255,.2)'>
+              <b>University ID:</b> {card.get('university_id','')}<br>
+              <b>DOB:</b> {card.get('dob','')} &nbsp; <b>Blood:</b> {card.get('blood_group','')}<br>
+              <b>Department:</b> {card.get('department','')} &nbsp; <b>Semester:</b> {card.get('semester','')}<br>
+              <b>College:</b> {card.get('studied_college','')}<br>
+              <b>Address:</b> {card.get('address','')}<br>
+              <b>PIN:</b> {card.get('pin_code','')} &nbsp; <b>CGPA:</b> {card.get('cgpa','') or '—'}
+            </div>
+            """, unsafe_allow_html=True)
 
     with tab5:
-        st.subheader("📅 Day-by-Day Recorded Files / Tables")
-        st.caption("Every day is kept separately as YYYY-MM-DD. The tables below are regenerated from the live Supabase database, so a deleted student is removed from the displayed records.")
-        rate_for_daily = float(rate) if "rate" in locals() else 100.0
-        daily_root, available_days = write_daily_records(students, tutors, marks, smart, audit, completed, rate_for_daily)
-        if not available_days:
-            st.info("No dated records available yet.")
+        st.subheader("📅 Student Activity — Date Wise")
+        if not student_activity:
+            st.info("No student activity recorded yet.")
         else:
-            selected_day = st.selectbox("📅 Select recording day", available_days, key="principal_daily_day")
-            day_folder = os.path.join(daily_root, safe_folder_name(selected_day))
-            st.markdown(f"### 📅 Records for {selected_day}")
-            files_for_day = [
-                ("students_records.csv", "👨‍🎓 Students"),
-                ("tutors_records.csv", "👨‍🏫 Tutors"),
-                ("marks_records.csv", "📝 Marks"),
-                ("smart_cards_records.csv", "🪪 Smart Cards"),
-                ("tutor_activity.csv", "🔴 Tutor Activity"),
-                ("completed_salary_records.csv", "💰 Completed / Salary"),
-            ]
-            for filename, title in files_for_day:
-                path = os.path.join(day_folder, filename)
-                st.markdown(f"**{title}** — `{filename}`")
-                if os.path.isfile(path):
-                    try:
-                        ddf = pd.read_csv(path)
-                    except Exception:
-                        ddf = pd.DataFrame()
-                    if ddf.empty:
-                        st.info("No records in this table for this day.")
-                    else:
-                        st.dataframe(ddf, use_container_width=True, hide_index=True)
-                        st.download_button(f"📥 Download {filename}", ddf.to_csv(index=False).encode(), filename, "text/csv", key=f"daily_download_{selected_day}_{filename}")
-                else:
-                    st.info("No records in this table for this day.")
+            activity_rows = []
+            for r in student_activity:
+                activity_rows.append({
+                    "Date": month_label(r.get("timestamp")) if False else (parse_event_dt(r.get("timestamp")).strftime("%Y-%m-%d") if not pd.isna(parse_event_dt(r.get("timestamp"))) else "Unknown"),
+                    "Time": r.get("timestamp", ""),
+                    "Action": r.get("action", ""),
+                    "University ID": r.get("university_id", ""),
+                    "Department": r.get("department", ""),
+                    "Semester": str(r.get("semester", "")).upper(),
+                    "Details": r.get("details", ""),
+                })
+            adf = pd.DataFrame(activity_rows)
+            st.dataframe(adf, use_container_width=True, hide_index=True)
+            st.download_button("📥 Download Student Activity", adf.to_csv(index=False).encode(), "student_activity.csv", "text/csv")
 
-        st.caption(f"Daily files are generated under `{daily_root}` on the current Streamlit runtime. Supabase is the permanent source of truth.")
+            st.subheader("📂 Daily Activity Tables")
+            for date_value, day_df in adf.groupby("Date", sort=False):
+                with st.expander(f"📅 {date_value} — {len(day_df)} activities"):
+                    st.dataframe(day_df, use_container_width=True, hide_index=True)
 
+        st.subheader("📎 Uploaded Student Files")
+        if files:
+            fdf = pd.DataFrame([{
+                "Uploaded At": r.get("uploaded_at", ""),
+                "University ID": r.get("university_id", ""),
+                "File Name": r.get("file_name", ""),
+                "File Path": r.get("file_path", ""),
+                "Uploaded By": r.get("uploaded_by", ""),
+            } for r in files])
+            st.dataframe(fdf, use_container_width=True, hide_index=True)
+        else:
+            st.info("No student files uploaded yet.")
 
-    with tab7:
+    with tab6:
         st.subheader("🗑️ Delete Student — One at a Time")
-        st.warning("⚠️ Permanent deletion: this removes the selected student's registration, marks/results, Smart Card, uploaded student files, old tutor activity, daily Principal records and related Supabase records. A new deletion audit entry is kept.")
+        st.warning("This permanently removes the selected student's registration, marks, Smart Card, uploaded file records and known local files. It does not delete other students.")
         if not students:
             st.info("No registered students are available to delete.")
         else:
@@ -882,18 +601,16 @@ def dashboard():
                 f"{r.get('university_id','')} — {r.get('student_name','')} — {r.get('department','')} / {r.get('semester','')}": r
                 for r in students
             }
-            selected_label = st.selectbox("Select ONE student to delete", list(student_options.keys()), key="principal_delete_student_select")
+            selected_label = st.selectbox("Select ONE student", list(student_options.keys()), key="principal_delete_student_select")
             selected_student = student_options[selected_label]
-            st.markdown("### Selected student")
-            preview = pd.DataFrame([{
+            st.dataframe(pd.DataFrame([{
                 "University ID": selected_student.get("university_id", ""),
                 "Student Name": selected_student.get("student_name", ""),
                 "Department": selected_student.get("department", ""),
                 "Semester": selected_student.get("semester", ""),
                 "Studied College": selected_student.get("studied_college", "") or "",
-                "Registered By": selected_student.get("registered_by", "") or "",
-            }])
-            st.dataframe(preview, use_container_width=True, hide_index=True)
+                "Registered At": selected_student.get("registered_at", "") or "",
+            }]), use_container_width=True, hide_index=True)
             confirm = st.checkbox("I understand this permanently deletes ALL details for this selected student.", key="principal_delete_student_confirm")
             if st.button("🗑️ DELETE SELECTED STUDENT", type="primary", use_container_width=True, disabled=not confirm):
                 try:
@@ -904,6 +621,7 @@ def dashboard():
                     st.rerun()
                 except Exception as exc:
                     st.error(f"❌ Delete failed: {exc}")
+
 
 
 
