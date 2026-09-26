@@ -2,6 +2,8 @@
 
 Run:
     streamlit run principal_dashboard.py
+
+The real Principal dashboard is implemented in app2.py.
 """
 
 import app2
